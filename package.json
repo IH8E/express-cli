@@ -1,10 +1,16 @@
 {
-  "name": "express-cli",
-  "version": "0.1.0",
+  "name": "@ih8e/express-cli",
+  "version": "0.1.1",
   "description": "CLI/TUI/MCP client for eXpress Chat",
   "type": "module",
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
-    "express-cli": "./dist/index.js"
+    "express-cli": "dist/index.js"
   },
   "scripts": {
     "build": "tsup",

@@ -18,6 +18,7 @@ export function createMessagesCommand(): Command {
         const messages = await readMessages({
           chatId,
           limit: parseInt(opts.limit, 10) || 20,
+          host: opts.host,
         });
 
         if (opts.output === "json") {

@@ -9,19 +9,20 @@ export async function readMessages(params: {
   limit?: number;
   timeoutMs?: number;
   direction?: "backward" | "forward";
+  host?: string;
 }): Promise<DecryptedMessage[]> {
-  const { chatId, limit = 20, timeoutMs = 20000, direction = "backward" } = params;
+  const { chatId, limit = 20, timeoutMs = 20000, direction = "backward", host } = params;
 
   const apigwKeys = loadApigwKeys();
   if (!apigwKeys) throw new Error("No apigw keys. Run 'express auth login' first.");
 
-  const config = loadConfig();
-  const host = new URL(getBaseUrl(config)).hostname;
+  const config = loadConfig(host ? { host } : {});
+  const ctsHost = new URL(getBaseUrl(config)).hostname;
   const webOrigin = getWebOrigin(config);
   const ctsToken = getAuthToken();
   const ctsKey = apigwKeys.ctsKey ?? apigwKeys.encryptionKey;
 
-  const history = await fetchEventsHistory(host, webOrigin, ctsToken, ctsKey.keyId, chatId, limit, timeoutMs, direction);
+  const history = await fetchEventsHistory(ctsHost, webOrigin, ctsToken, ctsKey.keyId, chatId, limit, timeoutMs, direction);
   return decryptMessages(history, apigwKeys);
 }
 
