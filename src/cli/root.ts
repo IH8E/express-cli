@@ -20,8 +20,7 @@ export function createRootCommand(): Command {
   program
     .name("express-cli")
     .description("CLI client for eXpress Chat")
-    .version("0.1.0")
-    .option("--host <host>", "eXpress server host");
+    .version("0.1.2");
 
   program.addCommand(createAuthCommand());
   program.addCommand(createApiCommand());
