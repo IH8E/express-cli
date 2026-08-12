@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Captured traffic & request dumps — contain auth tokens, private keys and
+# personal data. NEVER commit these.
+*.har
+requests.txt
+new_requests.txt
+
+# Scratch notes / debug scripts (may contain key material or tokens)
+lastActions.md
+ws_listener.mjs
+
+# Local tooling config (machine-specific)
+.claude/settings.local.json
+CLAUDE.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
