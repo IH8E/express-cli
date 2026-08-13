@@ -28,21 +28,26 @@ export class ChatsApi {
     const keys = loadApigwKeys();
 
     const ctsKeyId = (keys?.ctsKey ?? keys?.encryptionKey)?.keyId;
-    if (ctsToken && ctsKeyId) {
-      try {
-        return await fetchChatListViaWebSocket({
-          host,
-          ctsToken,
-          encryptionKeyId: ctsKeyId,
-        });
-      } catch (err) {
-        if (process.env.EXPRESS_DEBUG) {
-          console.error(`  [DEBUG] WebSocket failed, falling back to directory: ${(err as Error).message}`);
-        }
-      }
+    if (!ctsToken || !ctsKeyId) {
+      console.error(
+        !ctsToken
+          ? "Warning: no auth token — run `express-cli auth import <token>` or `express-cli auth qr`"
+          : "Warning: no encryption keys — run `express-cli auth qr` to authenticate"
+      );
+      console.error("Falling back to corporate directory (shows only global/public chats).\n");
+      return this.listChatsViaDirectory();
     }
 
-    return this.listChatsViaDirectory();
+    try {
+      return await fetchChatListViaWebSocket({
+        host,
+        ctsToken,
+        encryptionKeyId: ctsKeyId,
+      });
+    } catch (err) {
+      console.error(`Warning: WebSocket failed (${(err as Error).message}), falling back to corporate directory.\n`);
+      return this.listChatsViaDirectory();
+    }
   }
 
   private async listChatsViaDirectory(): Promise<ExpressChat[]> {

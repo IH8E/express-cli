@@ -1,3 +1,4 @@
+import WebSocket from "ws";
 import { randomBytes, randomUUID } from "node:crypto";
 import nacl from "tweetnacl";
 import sodium from "libsodium-wrappers-sumo";
@@ -161,7 +162,7 @@ async function getChatKeyIds(
 
     const ws = new WebSocket(wsUrl, {
       headers: { Origin: webOrigin, "User-Agent": "Mozilla/5.0" },
-    } as ConstructorParameters<typeof WebSocket>[1]);
+    });
 
     let ref = 0;
     const authRef = ref++;
@@ -231,7 +232,7 @@ async function sendMessageNew(params: {
 
     const ws = new WebSocket(wsUrl, {
       headers: { Origin: webOrigin, "User-Agent": "Mozilla/5.0" },
-    } as ConstructorParameters<typeof WebSocket>[1]);
+    });
 
     let ref = 0;
     const authRef = ref++;

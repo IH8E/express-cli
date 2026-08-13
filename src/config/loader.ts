@@ -1,3 +1,4 @@
+import { ZodError } from "zod";
 import { configSchema, type Config } from "../types/index.js";
 import { getStoredConfig, getAuthToken } from "./store.js";
 
@@ -21,7 +22,15 @@ export function loadConfig(cliOverrides: Partial<Config> = {}): Config {
     if (storedToken) merged.token = storedToken;
   }
 
-  return configSchema.parse(merged);
+  try {
+    return configSchema.parse(merged);
+  } catch (err) {
+    if (err instanceof ZodError) {
+      const details = err.issues.map((i) => `  ${i.path.join(".")}: ${i.message}`).join("\n");
+      throw new Error(`Configuration error:\n${details}\n\nRun: express-cli config set host <hostname>`);
+    }
+    throw err;
+  }
 }
 
 export function getBaseUrl(config: Config): string {

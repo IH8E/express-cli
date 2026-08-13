@@ -1,3 +1,4 @@
+import WebSocket from "ws";
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { loadApigwKeys, type ApigwKeys } from "../auth/keys.js";
@@ -118,7 +119,7 @@ export class ExpressSession extends EventEmitter {
       + `&version=6&background=false&voex_unencrypted=true&voex_multistream=true&voex_audio_bridge=true&instance_id=${randomUUID()}`;
     const ws = new WebSocket(url, {
       headers: { Origin: this.webOrigin, "User-Agent": "Mozilla/5.0" },
-    } as ConstructorParameters<typeof WebSocket>[1]);
+    });
     this.ws = ws;
 
     // Only the currently-active socket's events matter; ignore stale ones.

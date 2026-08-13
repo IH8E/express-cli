@@ -1,3 +1,4 @@
+import WebSocket from "ws";
 import { randomUUID } from "node:crypto";
 import { loadApigwKeys } from "../auth/keys.js";
 import { getAuthToken } from "../config/store.js";
@@ -48,7 +49,7 @@ async function fetchEventsHistory(
 
     const ws = new WebSocket(wsUrl, {
       headers: { Origin: webOrigin, "User-Agent": "Mozilla/5.0" },
-    } as ConstructorParameters<typeof WebSocket>[1]);
+    });
 
     let ref = 0;
     const authRef = ref++;

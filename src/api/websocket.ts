@@ -1,3 +1,4 @@
+import WebSocket from "ws";
 import type { ExpressChat } from "../types/index.js";
 import { randomUUID } from "node:crypto";
 
@@ -48,7 +49,7 @@ export async function fetchChatListViaWebSocket(params: {
         Origin: webOrigin,
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
       },
-    } as ConstructorParameters<typeof WebSocket>[1]);
+    });
 
     const authRef = 0;
     const chatListRef = 1;
