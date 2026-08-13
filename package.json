@@ -1,6 +1,6 @@
 {
   "name": "@ih8e/express-cli",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "CLI/TUI/MCP client for eXpress Chat",
   "type": "module",
   "files": [
