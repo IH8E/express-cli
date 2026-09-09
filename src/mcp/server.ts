@@ -1,6 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { writeFileSync, readFileSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ApiClient } from "../api/client.js";
 import { PhonebookApi } from "../api/phonebook.js";
 import { UserApi } from "../api/user.js";
@@ -8,12 +11,29 @@ import { readMessages } from "../api/messages-read.js";
 import { sendMessageViaWebSocket } from "../api/messaging-ws.js";
 import { resolveChatId, listChatsWithNames } from "../api/resolve.js";
 import { getAuthToken, getTokenExpiresAt } from "../config/store.js";
+import { refreshToken } from "../auth/token-refresh.js";
+import { buildQrMaterial, pollForQrScan, completeQrRegistration } from "../auth/qr-login.js";
+import { openQrInBrowser } from "../auth/qr-browser.js";
 import { ExpressSession, type SessionMessage } from "../session/session.js";
 import type { ExpressChat } from "../types/index.js";
+import qrcode from "qrcode-terminal";
+
+const AUTH_INSTRUCTION = "Run 'express-cli auth qr' (or 'npx @ih8e/express-cli auth qr') in a terminal to log in.";
 
 const ok = (data: unknown) => ({
   content: [{ type: "text" as const, text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }],
 });
+
+const notAuthenticated = () => ok({ error: "not_authenticated", instruction: AUTH_INSTRUCTION });
+
+/** Refresh if token expires within 5 minutes; return true if auth is valid after. */
+async function ensureAuth(): Promise<boolean> {
+  const exp = getTokenExpiresAt();
+  if (exp && Date.now() > exp - 5 * 60 * 1000) {
+    await refreshToken();
+  }
+  return !!getAuthToken();
+}
 
 interface Incoming { seq: number; chatId: string; sender: string; body: string; time: string; decrypted: boolean; image?: string }
 
@@ -47,6 +67,7 @@ class Inbox {
     return items;
   }
 }
+
 
 /**
  * MCP server (stdio) exposing eXpress chat over the existing api layer. Reuses the
@@ -96,6 +117,7 @@ export async function runMcpServer(): Promise<void> {
     description: "List chats (DMs, groups, channels) with names and full chat IDs. DM names are resolved to the person's full name.",
     inputSchema: { type: z.enum(["all", "dm", "group", "channel"]).optional().describe("Filter by chat type (default all)") },
   }, async ({ type }) => {
+    if (!await ensureAuth()) return notAuthenticated();
     const chats = await listChatsWithNames(new ApiClient());
     const kind: Record<string, string> = { dm: "chat", group: "group_chat", channel: "channel" };
     const filtered = !type || type === "all" ? chats : chats.filter((c) => c.chat_type === kind[type]);
@@ -107,6 +129,7 @@ export async function runMcpServer(): Promise<void> {
     description: "Find chats whose name (person or group) contains the query. Returns name + full chat_id to use with other tools.",
     inputSchema: { query: z.string().describe("Part of the chat or person name") },
   }, async ({ query }) => {
+    if (!await ensureAuth()) return notAuthenticated();
     const chats = await listChatsWithNames(new ApiClient());
     const q = query.toLowerCase();
     return ok(chats.filter((c) => (c.name ?? "").toLowerCase().includes(q)).map((c) => ({ name: c.name, chat_id: c.group_chat_id, type: c.chat_type })));
@@ -120,6 +143,7 @@ export async function runMcpServer(): Promise<void> {
       limit: z.number().int().min(1).max(200).optional().describe("How many recent messages (default 20)"),
     },
   }, async ({ chat, limit }) => {
+    if (!await ensureAuth()) return notAuthenticated();
     const client = new ApiClient();
     const chatId = await resolveChatId(client, chat);
     const msgs = await readMessages({ chatId, limit: limit ?? 20 });
@@ -132,9 +156,10 @@ export async function runMcpServer(): Promise<void> {
 
   server.registerTool("send_message", {
     title: "Send a message",
-    description: "Send a text message to a chat, identified by name (partial ok) or chat_id. Returns the sync_id.",
+    description: "Send a text message to a chat, identified by name (partial ok) or chat_id. If no DM exists with that person, one is created automatically. Returns the sync_id.",
     inputSchema: { chat: z.string().describe("Chat name or full chat_id"), text: z.string().describe("Message text") },
   }, async ({ chat, text }) => {
+    if (!await ensureAuth()) return notAuthenticated();
     const client = new ApiClient();
     const chatId = await resolveChatId(client, chat);
     const res = await sendMessageViaWebSocket({ client, chatId, body: text });
@@ -146,6 +171,7 @@ export async function runMcpServer(): Promise<void> {
     description: "Global company phonebook search across all employees by name.",
     inputSchema: { query: z.string().describe("Name to search"), limit: z.number().int().min(1).max(50).optional() },
   }, async ({ query, limit }) => {
+    if (!await ensureAuth()) return notAuthenticated();
     const profiles = await new PhonebookApi(new ApiClient()).searchUsers(query, limit ?? 20);
     return ok(profiles.map((p) => ({ name: p.name, huid: p.user_huid, email: p.email, position: p.company_position, department: p.department })));
   });
@@ -154,28 +180,151 @@ export async function runMcpServer(): Promise<void> {
     title: "My profile",
     description: "Get the authenticated user's own profile.",
     inputSchema: {},
-  }, async () => ok(await new UserApi(new ApiClient()).getSelfProfile()));
+  }, async () => {
+    if (!await ensureAuth()) return notAuthenticated();
+    return ok(await new UserApi(new ApiClient()).getSelfProfile());
+  });
 
   server.registerTool("wait_for_messages", {
     title: "Wait for incoming messages",
     description: "Block until new incoming messages arrive (from any chat/discussion), then return them. Returns messages received since the previous call to this tool; if none are pending, waits up to timeout_seconds. Your own sent messages are not included. Use this to react to new messages instead of polling.",
     inputSchema: { timeout_seconds: z.number().int().min(1).max(120).optional().describe("Max seconds to wait when nothing is pending (default 30)") },
   }, async ({ timeout_seconds }) => {
-    if (!session) return ok({ error: "Session unavailable — run 'express auth qr' to authenticate." });
+    if (!session) return ok({ error: "Session unavailable.", instruction: AUTH_INSTRUCTION });
     const items = await inbox.take((timeout_seconds ?? 30) * 1000);
     return ok({ connected: sessionReady, count: items.length, messages: await enrich(items) });
   });
 
   server.registerTool("status", {
     title: "Auth status",
-    description: "Check authentication and access-token status.",
+    description: "Check authentication and access-token status. Call this first if other tools return not_authenticated.",
     inputSchema: {},
   }, async () => {
     const exp = getTokenExpiresAt();
     return ok({
       authenticated: !!getAuthToken(),
       token_expires_in_seconds: exp ? Math.max(0, Math.floor((exp - Date.now()) / 1000)) : null,
+      login_instruction: AUTH_INSTRUCTION,
     });
+  });
+
+  // ─── QR login (two-phase) ──────────────────────────────────────────────────
+  //
+  // Phase 1 (auth_qr_start): generates QR material, persists it to disk so that
+  //   auth_qr_poll can recover it even after a server restart, kicks off the
+  //   background long-poll, and returns the QR ASCII inline (no bash cat needed).
+  //   Model MUST call auth_qr_poll immediately after — no user confirmation needed.
+  //
+  // Phase 2 (auth_qr_poll): awaits the background poll (or re-spawns it from the
+  //   persisted material if the server restarted), then completes registration.
+
+  const QR_MATERIAL_FILE = join(tmpdir(), "express-qr-material.json");
+
+  let pendingQrMaterial: ReturnType<typeof buildQrMaterial> | null = null;
+  let pendingQrPoll: Promise<Awaited<ReturnType<typeof pollForQrScan>>> | null = null;
+
+  server.registerTool("auth_qr_start", {
+    title: "Start QR login — step 1 of 2",
+    description:
+      "Step 1: generate a QR code for eXpress login. " +
+      "The QR code is included in the response — display it to the user as-is. " +
+      "After displaying the QR you MUST immediately call the MCP tool `auth_qr_poll` (step 2) — " +
+      "do NOT wait for the user to confirm scanning first; auth_qr_poll waits automatically. " +
+      "Do NOT run auth_qr_poll as a shell command — it is an MCP tool. " +
+      "Use when status reports not_authenticated.",
+    inputSchema: {},
+  }, async () => {
+    const material = buildQrMaterial();
+
+    let qrAscii = "";
+    qrcode.generate(material.qrPayload, { small: true }, (qr: string) => { qrAscii = qr; });
+
+    writeFileSync(join(tmpdir(), "express-qr.txt"), qrAscii, "utf8");
+    process.stderr.write("\n" + qrAscii + "\n");
+    openQrInBrowser(material.qrPayload, material.registrationId).catch(() => {});
+
+    // Persist serialisable fields so auth_qr_poll can recover after a server restart.
+    const persistent = {
+      registrationId: material.registrationId,
+      encryptionKey: Buffer.from(material.encryptionKey).toString("base64"),
+      qrSigningKey: {
+        keyId: material.qrSigningKey.keyId,
+        privateKey: Buffer.from(material.qrSigningKey.privateKey).toString("base64"),
+        publicKey: Buffer.from(material.qrSigningKey.publicKey).toString("base64"),
+      },
+      udid: material.udid,
+      qrPayload: material.qrPayload,
+      qrBody: material.qrBody,
+    };
+    writeFileSync(QR_MATERIAL_FILE, JSON.stringify(persistent), "utf8");
+
+    pendingQrMaterial = material;
+    pendingQrPoll = pollForQrScan(material).catch((err) => {
+      process.stderr.write(`[mcp] QR poll error: ${(err as Error).message}\n`);
+      pendingQrMaterial = null;
+      pendingQrPoll = null;
+      throw err;
+    });
+
+    return ok(
+      `${qrAscii.trim()}\n\n` +
+      `Scan with the eXpress mobile app.\n\n` +
+      `[AGENT: call auth_qr_poll immediately — do not wait for user input]`,
+    );
+  });
+
+  server.registerTool("auth_qr_poll", {
+    title: "Complete QR login — step 2 of 2",
+    description:
+      "Step 2: wait for the phone scan and complete QR login. " +
+      "Call this immediately after auth_qr_start — do NOT wait for user confirmation. " +
+      "Waits up to 90 s for the server handshake, then saves tokens and keys. " +
+      "IMPORTANT: call this as an MCP tool, not as a shell command.",
+    inputSchema: {},
+  }, async () => {
+    let material = pendingQrMaterial;
+    let poll = pendingQrPoll;
+
+    // If server restarted and lost in-memory state, recover from disk.
+    if (!material || !poll) {
+      let saved: Record<string, unknown> | null = null;
+      try { saved = JSON.parse(readFileSync(QR_MATERIAL_FILE, "utf8")) as Record<string, unknown>; } catch { /* no file */ }
+
+      if (!saved) return ok("No pending QR session. Call auth_qr_start first.");
+
+      // Re-hydrate material from persisted data.
+      const sk = saved.qrSigningKey as Record<string, string>;
+      const hydrated = {
+        registrationId: saved.registrationId as string,
+        encryptionKey: Buffer.from(saved.encryptionKey as string, "base64"),
+        qrSigningKey: {
+          keyId: sk.keyId,
+          privateKey: Buffer.from(sk.privateKey, "base64"),
+          publicKey: Buffer.from(sk.publicKey, "base64"),
+        },
+        udid: saved.udid as string,
+        qrPayload: saved.qrPayload as string,
+        qrBody: saved.qrBody as string,
+        config: (await import("../config/loader.js")).loadConfig(),
+      } as ReturnType<typeof buildQrMaterial>;
+
+      material = hydrated;
+      poll = pollForQrScan(material);
+    }
+
+    pendingQrMaterial = null;
+    pendingQrPoll = null;
+    try { unlinkSync(QR_MATERIAL_FILE); } catch { /* already gone */ }
+
+    try {
+      const pollResult = await poll;
+      await completeQrRegistration(material, pollResult, (msg) => {
+        process.stderr.write(msg + "\n");
+      });
+      return ok("Login successful. You are now authenticated.");
+    } catch (err) {
+      return ok(`Login failed: ${(err as Error).message}`);
+    }
   });
 
   await server.connect(new StdioServerTransport());

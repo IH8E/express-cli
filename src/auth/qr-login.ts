@@ -1,5 +1,6 @@
 import { generateSigningKeyPair, publicKeyToBase64, saveApigwKeys, loadApigwKeys, decryptRegistrationData, decryptRtsToken, extractRtsKeyIdFromToken, type ApigwKeys } from "./keys.js";
 import { signQrRequest, signApigwRequest } from "./apigw-signer.js";
+import { openQrInBrowser } from "./qr-browser.js";
 import { setAuthToken, setRtsAuthToken, setRefreshToken, setTokenExpiresAt, calcTokenExpiresAt, setEtsAuthToken } from "../config/store.js";
 import { loadConfig, getBaseUrl, getEtsBaseUrl, getWebOrigin } from "../config/loader.js";
 import type { Config } from "../types/index.js";
@@ -94,17 +95,42 @@ function commonHeaders(webOrigin: string): Record<string, string> {
   };
 }
 
-export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void> {
-  const config = loadConfig(cliOverrides);
-  const etsBaseUrl = getEtsBaseUrl(config);
-  const webOrigin = getWebOrigin(config);
+// ─── Exported types and phase functions ──────────────────────────────────────
 
+export interface QrMaterial {
+  registrationId: string;
+  encryptionKey: Buffer;
+  qrSigningKey: ReturnType<typeof generateSigningKeyPair>;
+  udid: string;
+  /** JSON encoded in the QR image the phone scans */
+  qrPayload: string;
+  /** POST body for the ETS long-poll request */
+  qrBody: string;
+  config: ReturnType<typeof loadConfig>;
+}
+
+export interface QrPollResult {
+  ctsRegistrationToken: string;
+  rtsRegistrationToken: string;
+  registrationData: string;
+}
+
+/** Phase 1: generate all key material and QR payloads (synchronous). */
+export function buildQrMaterial(cliOverrides: Partial<Config> = {}): QrMaterial {
+  const config = loadConfig(cliOverrides);
   const qrSigningKey = generateSigningKeyPair();
   const registrationId = qrSigningKey.keyId;
   const registrationToken = Buffer.from(randomBytes(64)).toString("base64");
   const signPubKey = publicKeyToBase64(qrSigningKey.publicKey);
   const udid = randomUUID();
   const encryptionKey = randomBytes(32);
+
+  const qrPayload = JSON.stringify({
+    registration_id: registrationId,
+    registration_token: registrationToken,
+    registration_key: Buffer.from(encryptionKey).toString("base64"),
+    version: 1,
+  });
 
   const qrBody = JSON.stringify({
     registration_id: registrationId,
@@ -126,78 +152,71 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
     platform_package_id: "com.pyligrim.alphach",
   });
 
-  const qrPayload = JSON.stringify({
-    registration_id: registrationId,
-    registration_token: registrationToken,
-    registration_key: Buffer.from(encryptionKey).toString("base64"),
-    version: 1,
-  });
+  return { registrationId, encryptionKey, qrSigningKey, udid, qrPayload, qrBody, config };
+}
 
-  console.log("Step 1/7: Scan this QR code with your eXpress app:\n");
-  qrcode.generate(qrPayload, { small: true }, (qr: string) => {
-    console.log(qr);
-  });
-  console.log(`\n  registration_id: ${registrationId}`);
-  console.log("  Waiting for scan (server long-polling)...\n");
-
+/** Phase 2: long-poll ETS until the phone scans the QR. */
+export async function pollForQrScan(mat: QrMaterial): Promise<QrPollResult> {
+  const etsBaseUrl = getEtsBaseUrl(mat.config);
+  const webOrigin = getWebOrigin(mat.config);
   const etsUrl = `${etsBaseUrl}/api/v1/authentication/qr/mobile_to_web/request`;
   const qrHeaders = signQrRequest({
     method: "POST",
     url: etsUrl,
-    body: qrBody,
-    registrationId,
-    privateKey: qrSigningKey.privateKey,
+    body: mat.qrBody,
+    registrationId: mat.registrationId,
+    privateKey: mat.qrSigningKey.privateKey,
   });
 
-  let qrRes: Response;
+  let res: Response;
   try {
-    qrRes = await fetch(etsUrl, {
+    res = await fetch(etsUrl, {
       method: "POST",
       headers: { ...commonHeaders(webOrigin), ...qrHeaders },
-      body: qrBody,
+      body: mat.qrBody,
     });
   } catch (err) {
     throw new Error(`QR request network error: ${(err as Error).message}`);
   }
 
-  const qrText = await qrRes.text();
+  const text = await res.text();
+  if (!res.ok) throw new Error(`QR request failed (${res.status}): ${text.slice(0, 500)}`);
 
-  if (!qrRes.ok) {
-    console.log(`  Response (${qrRes.status}): ${qrText.slice(0, 500)}`);
-    throw new Error(`QR request failed (${qrRes.status}): ${qrText.slice(0, 500)}`);
-  }
+  const data = JSON.parse(text) as QrRequestResponse;
+  if (process.env.EXPRESS_DEBUG) process.stderr.write(`[qr] full response: ${text.slice(0, 1000)}\n`);
 
-  let qrData: QrRequestResponse;
-  try {
-    qrData = JSON.parse(qrText) as QrRequestResponse;
-  } catch {
-    throw new Error(`Invalid QR response: ${qrText.slice(0, 500)}`);
-  }
-
-  if (process.env.EXPRESS_DEBUG) {
-    console.log(`  [DEBUG] QR full response: ${qrText.slice(0, 1000)}`);
-  }
-
-  const qrResult = extractResult(qrData);
-  const ctsRegistrationToken = qrResult.cts_registration_token ?? "";
-  const rtsRegistrationToken = qrResult.rts_registration_token ?? "";
-  const registrationData = qrResult.registration_data ?? "";
-
-  console.log("  QR scanned! Got tokens from server.");
-  if (process.env.EXPRESS_DEBUG) {
-    console.log(`  [DEBUG] registration_data length: ${registrationData.length}`);
-    console.log(`  [DEBUG] registration_data raw: ${registrationData.slice(0, 100)}...`);
-    console.log(`  [DEBUG] encryptionKey (registration_key) hex: ${Buffer.from(encryptionKey).toString("hex")}`);
-  }
+  const result = extractResult(data);
+  const ctsRegistrationToken = result.cts_registration_token ?? "";
+  const rtsRegistrationToken = result.rts_registration_token ?? "";
+  const registrationData = result.registration_data ?? "";
 
   if (!ctsRegistrationToken && !rtsRegistrationToken) {
-    throw new Error(`No tokens in QR response: ${qrText.slice(0, 500)}`);
+    throw new Error(`No tokens in QR response: ${text.slice(0, 500)}`);
+  }
+
+  return { ctsRegistrationToken, rtsRegistrationToken, registrationData };
+}
+
+/** Phase 3: complete registration steps 2–7. `log` defaults to console.log. */
+export async function completeQrRegistration(
+  mat: QrMaterial,
+  poll: QrPollResult,
+  log: (msg: string) => void = console.log,
+): Promise<void> {
+  const { config, registrationId, encryptionKey, qrSigningKey } = mat;
+  const { ctsRegistrationToken, rtsRegistrationToken, registrationData } = poll;
+  const etsBaseUrl = getEtsBaseUrl(config);
+  const webOrigin = getWebOrigin(config);
+
+  log("  QR scanned! Got tokens from server.");
+  if (process.env.EXPRESS_DEBUG) {
+    log(`  [DEBUG] registration_data length: ${registrationData.length}`);
+    log(`  [DEBUG] registration_data raw: ${registrationData.slice(0, 100)}...`);
+    log(`  [DEBUG] encryptionKey (registration_key) hex: ${Buffer.from(encryptionKey).toString("hex")}`);
   }
 
   let rtsPrivateKey: Uint8Array | null = null;
   let rtsPublicKeyId = "";
-  // CTS (E2E) key transferred from the phone via the QR handshake — this is the
-  // shared account key, so QR login alone yields a working E2E key (no import).
   let qrCtsPrivateKey: Uint8Array | null = null;
   let qrCtsKeyId = "";
 
@@ -205,14 +224,14 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
     try {
       const raw = Uint8Array.from(Buffer.from(registrationData, "base64"));
       if (process.env.EXPRESS_DEBUG) {
-        console.log(`  [DEBUG] registration_data decoded length: ${raw.length}`);
-        console.log(`  [DEBUG] first 40 bytes hex: ${Buffer.from(raw.slice(0, 40)).toString("hex")}`);
-        console.log(`  [DEBUG] encryptionKey hex: ${Buffer.from(encryptionKey).toString("hex")}`);
-        console.log(`  [DEBUG] encryptionKey length: ${encryptionKey.length}`);
+        log(`  [DEBUG] registration_data decoded length: ${raw.length}`);
+        log(`  [DEBUG] first 40 bytes hex: ${Buffer.from(raw.slice(0, 40)).toString("hex")}`);
+        log(`  [DEBUG] encryptionKey hex: ${Buffer.from(encryptionKey).toString("hex")}`);
+        log(`  [DEBUG] encryptionKey length: ${encryptionKey.length}`);
       }
       const decrypted = decryptRegistrationData(registrationData, encryptionKey);
       if (process.env.EXPRESS_DEBUG) {
-        console.log("  Decrypted registration_data:", JSON.stringify(decrypted).slice(0, 500));
+        log("  Decrypted registration_data: " + JSON.stringify(decrypted).slice(0, 500));
       }
 
       if (decrypted && typeof decrypted === "object") {
@@ -223,18 +242,17 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
         if (typeof data.rts_pub_key_id === "string") {
           rtsPublicKeyId = data.rts_pub_key_id as string;
         }
-        // CTS/E2E key from the phone — key_id matches the account's current cts key
         if (typeof data.cts_priv_key_body === "string" && typeof data.cts_pub_key_id === "string") {
           qrCtsPrivateKey = new Uint8Array(Buffer.from(data.cts_priv_key_body as string, "base64"));
           qrCtsKeyId = data.cts_pub_key_id as string;
         }
       }
     } catch (err) {
-      console.log(`  Warning: could not decrypt registration_data: ${(err as Error).message}`);
+      log(`  Warning: could not decrypt registration_data: ${(err as Error).message}`);
     }
   }
 
-  console.log("\nStep 2/7: Confirming with ETS...");
+  log("\nStep 2: Confirming with ETS...");
 
   const confirmUrl = `${etsBaseUrl}/api/v1/authentication/register_confirm/qr`;
   const confirmBody = JSON.stringify({
@@ -257,28 +275,21 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
   });
 
   const confirmText = await confirmRes.text();
-
-  if (!confirmRes.ok) {
-    throw new Error(`ETS register_confirm failed (${confirmRes.status}): ${confirmText.slice(0, 500)}`);
-  }
+  if (!confirmRes.ok) throw new Error(`ETS register_confirm failed (${confirmRes.status}): ${confirmText.slice(0, 500)}`);
 
   const confirmData = extractResult(JSON.parse(confirmText) as RegisterConfirmResponse);
   const userHuid = confirmData.user_huid ?? "";
   const etsAuthToken = confirmData.auth_token ?? "";
 
-  console.log(`  ETS confirmed. User: ${userHuid || "unknown"}`);
+  log(`  ETS confirmed. User: ${userHuid || "unknown"}`);
   if (etsAuthToken) {
     setEtsAuthToken(etsAuthToken);
-    if (process.env.EXPRESS_DEBUG) {
-      console.log(`  [DEBUG] ETS auth_token saved (${etsAuthToken.length} chars)`);
-    }
+    if (process.env.EXPRESS_DEBUG) log(`  [DEBUG] ETS auth_token saved (${etsAuthToken.length} chars)`);
   }
 
-  if (!ctsRegistrationToken) {
-    throw new Error("No cts_registration_token — cannot confirm with CTS");
-  }
+  if (!ctsRegistrationToken) throw new Error("No cts_registration_token — cannot confirm with CTS");
 
-  console.log("\nStep 3/7: Confirming with CTS (AD integration)...");
+  log("\nStep 3: Confirming with CTS (AD integration)...");
 
   const ctsUrl = `${getBaseUrl(config)}/api/v1/ad_integration/register_confirm/qr`;
   const adConfirmBody = JSON.stringify({
@@ -302,44 +313,34 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
   });
 
   const adText = await adRes.text();
-
-  if (!adRes.ok) {
-    throw new Error(`AD integration confirm failed (${adRes.status}): ${adText.slice(0, 500)}`);
-  }
+  if (!adRes.ok) throw new Error(`AD integration confirm failed (${adRes.status}): ${adText.slice(0, 500)}`);
 
   const adData = extractResult(JSON.parse(adText) as AdIntegrationConfirmResponse);
   const accessToken = adData.access_token;
   const refreshToken = adData.refresh_token;
   const expiresIn = adData.expires_in;
-  const serverId = adData.server_id ?? userHuid;
+  const serverId = (adData as Record<string, unknown>).server_id as string ?? userHuid;
   const encryptedRtsToken = (adData as Record<string, unknown>).encrypted_rts_token as string | undefined;
 
   if (process.env.EXPRESS_DEBUG) {
     const adDataRaw = JSON.parse(adText);
-    console.log(`  [DEBUG] AD confirm full result keys: ${JSON.stringify(Object.keys(adDataRaw.result || adDataRaw))}`);
-    if (encryptedRtsToken) {
-      console.log(`  [DEBUG] encrypted_rts_token found: ${encryptedRtsToken.slice(0, 60)}...`);
-    } else {
-      console.log(`  [DEBUG] encrypted_rts_token NOT found in response`);
-    }
+    log(`  [DEBUG] AD confirm full result keys: ${JSON.stringify(Object.keys(adDataRaw.result || adDataRaw))}`);
+    if (encryptedRtsToken) log(`  [DEBUG] encrypted_rts_token found: ${encryptedRtsToken.slice(0, 60)}...`);
+    else log(`  [DEBUG] encrypted_rts_token NOT found in response`);
   }
 
-  if (!accessToken) {
-    throw new Error(`No access_token in AD confirm response: ${adText.slice(0, 500)}`);
-  }
+  if (!accessToken) throw new Error(`No access_token in AD confirm response: ${adText.slice(0, 500)}`);
 
   setAuthToken(accessToken);
-  if (refreshToken) {
-    setRefreshToken(refreshToken);
-  }
+  if (refreshToken) setRefreshToken(refreshToken);
   if (typeof expiresIn === "number") {
     setTokenExpiresAt(calcTokenExpiresAt(expiresIn));
-    console.log(`  Token expires in ${expiresIn}s (refresh after ${(expiresIn / 2 / 60).toFixed(0)} min)`);
+    log(`  Token expires in ${expiresIn}s (refresh after ${(expiresIn / 2 / 60).toFixed(0)} min)`);
   }
 
-  console.log(`  CTS confirmed. Access token: ${accessToken.slice(0, 40)}...`);
+  log(`  CTS confirmed. Access token: ${accessToken.slice(0, 40)}...`);
 
-  console.log("\nStep 4/7: Registering device token...");
+  log("\nStep 4: Registering device token...");
 
   const tokenUrl = `${getBaseUrl(config)}/api/v1/ad_integration/token`;
   const tokenBody = JSON.stringify({
@@ -360,26 +361,22 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
 
   const tokenRes = await fetch(tokenUrl, {
     method: "PUT",
-    headers: {
-      ...commonHeaders(webOrigin),
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
+    headers: { ...commonHeaders(webOrigin), Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
     body: tokenBody,
   });
 
   if (!tokenRes.ok) {
     const tokenErrText = await tokenRes.text().catch(() => "");
-    console.log(`  Warning: device token registration failed (${tokenRes.status}): ${tokenErrText.slice(0, 200)}`);
+    log(`  Warning: device token registration failed (${tokenRes.status}): ${tokenErrText.slice(0, 200)}`);
   } else {
-    console.log("  Device token registered.");
+    log("  Device token registered.");
   }
 
-  console.log("\nStep 5/7: Registering signing key + fetching server key...");
+  log("\nStep 5: Registering signing key + fetching server key...");
 
   if (process.env.EXPRESS_DEBUG) {
-    console.log(`  [DEBUG] serverId: ${serverId}`);
-    console.log(`  [DEBUG] userHuid: ${userHuid}`);
+    log(`  [DEBUG] serverId: ${serverId}`);
+    log(`  [DEBUG] userHuid: ${userHuid}`);
   }
 
   const apigwSigningKey = generateSigningKeyPair();
@@ -396,43 +393,31 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
   const [kdcSignRes, etsKdcSignRes, etsKdcStartRes] = await Promise.all([
     fetch(kdcSignUrl, {
       method: "POST",
-      headers: {
-        ...commonHeaders(webOrigin),
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
+      headers: { ...commonHeaders(webOrigin), Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
       body: kdcSignBody,
     }),
     fetch(`${etsBaseUrl}/api/v2/kdc/keys/${userHuid}`, {
       method: "POST",
-      headers: {
-        ...commonHeaders(webOrigin),
-        Authorization: `Bearer ${etsAuthToken}`,
-        "Content-Type": "application/json",
-      },
+      headers: { ...commonHeaders(webOrigin), Authorization: `Bearer ${etsAuthToken}`, "Content-Type": "application/json" },
       body: kdcSignBody,
     }),
-    fetch(`${etsBaseUrl}/api/v1/kdc/start`, {
-      headers: {
-        ...commonHeaders(webOrigin),
-      },
-    }),
+    fetch(`${etsBaseUrl}/api/v1/kdc/start`, { headers: { ...commonHeaders(webOrigin) } }),
   ]);
 
   if (!kdcSignRes.ok) {
     const kdcErrText = await kdcSignRes.text().catch(() => "");
-    console.log(`  Warning: CTS KDC signing key registration failed (${kdcSignRes.status}): ${kdcErrText.slice(0, 200)}`);
+    log(`  Warning: CTS KDC signing key registration failed (${kdcSignRes.status}): ${kdcErrText.slice(0, 200)}`);
   } else {
     const kdcSignData = await kdcSignRes.json().catch(() => null);
-    console.log(`  Signing key registered in CTS: ${apigwSigningKey.keyId}`, kdcSignData ? JSON.stringify(kdcSignData).slice(0, 200) : "");
+    log(`  Signing key registered in CTS: ${apigwSigningKey.keyId}` + (kdcSignData ? " " + JSON.stringify(kdcSignData).slice(0, 200) : ""));
   }
 
   if (!etsKdcSignRes.ok) {
     const etsErrText = await etsKdcSignRes.text().catch(() => "");
-    console.log(`  Warning: ETS KDC signing key registration failed (${etsKdcSignRes.status}): ${etsErrText.slice(0, 200)}`);
+    log(`  Warning: ETS KDC signing key registration failed (${etsKdcSignRes.status}): ${etsErrText.slice(0, 200)}`);
   } else {
     const etsSignData = await etsKdcSignRes.json().catch(() => null);
-    console.log(`  Signing key registered in ETS: ${apigwSigningKey.keyId}`, etsSignData ? JSON.stringify(etsSignData).slice(0, 200) : "");
+    log(`  Signing key registered in ETS: ${apigwSigningKey.keyId}` + (etsSignData ? " " + JSON.stringify(etsSignData).slice(0, 200) : ""));
   }
 
   let serverPublicKey = new Uint8Array(0);
@@ -440,16 +425,14 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
 
   if (etsKdcStartRes.ok) {
     const kdcStartText = await etsKdcStartRes.text();
-    if (process.env.EXPRESS_DEBUG) {
-      console.log(`  [DEBUG] ETS KDC start response: ${kdcStartText.slice(0, 500)}`);
-    }
+    if (process.env.EXPRESS_DEBUG) log(`  [DEBUG] ETS KDC start response: ${kdcStartText.slice(0, 500)}`);
     try {
       const kdcStartData = JSON.parse(kdcStartText) as { result?: string; status?: string };
       const keyBody = kdcStartData.result ?? kdcStartText;
       serverPublicKey = new Uint8Array(Buffer.from(keyBody, "base64"));
       serverPublicKeyId = "kdc-start-ets";
       const rawB64 = Buffer.from(serverPublicKey).toString("base64");
-      console.log(`  ETS server public key from /kdc/start: ${rawB64} (curve25519, used directly)`);
+      log(`  ETS server public key from /kdc/start: ${rawB64} (curve25519, used directly)`);
     } catch {
       try { serverPublicKey = new Uint8Array(Buffer.from(kdcStartText, "base64")); } catch {}
     }
@@ -457,8 +440,7 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
 
   if (!serverPublicKey.length) {
     if (process.env.EXPRESS_DEBUG && !etsKdcStartRes.ok) {
-      console.log(`  [DEBUG] ETS KDC start status: ${etsKdcStartRes.status}`);
-      try { console.log(`  [DEBUG] ETS KDC start body: ${(await etsKdcStartRes.text()).slice(0, 500)}`); } catch {}
+      log(`  [DEBUG] ETS KDC start status: ${etsKdcStartRes.status}`);
     }
     throw new Error("Could not fetch server public key from ETS /kdc/start");
   }
@@ -469,34 +451,26 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
     const [ctsRtsRes, etsRtsRes] = await Promise.all([
       fetch(kdcSignUrl, {
         method: "POST",
-        headers: {
-          ...commonHeaders(webOrigin),
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
+        headers: { ...commonHeaders(webOrigin), Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
         body: rtsKeyBody,
       }),
       fetch(`${etsBaseUrl}/api/v2/kdc/keys/${userHuid}`, {
         method: "POST",
-        headers: {
-          ...commonHeaders(webOrigin),
-          Authorization: `Bearer ${etsAuthToken}`,
-          "Content-Type": "application/json",
-        },
+        headers: { ...commonHeaders(webOrigin), Authorization: `Bearer ${etsAuthToken}`, "Content-Type": "application/json" },
         body: rtsKeyBody,
       }),
     ]);
     if (!ctsRtsRes.ok) {
       const errText = await ctsRtsRes.text().catch(() => "");
-      console.log(`  Warning: CTS RTS key registration failed (${ctsRtsRes.status}): ${errText.slice(0, 200)}`);
+      log(`  Warning: CTS RTS key registration failed (${ctsRtsRes.status}): ${errText.slice(0, 200)}`);
     } else {
-      console.log(`  RTS key registered in CTS: ${rtsPublicKeyId}`);
+      log(`  RTS key registered in CTS: ${rtsPublicKeyId}`);
     }
     if (!etsRtsRes.ok) {
       const errText = await etsRtsRes.text().catch(() => "");
-      console.log(`  Warning: ETS RTS key registration failed (${etsRtsRes.status}): ${errText.slice(0, 200)}`);
+      log(`  Warning: ETS RTS key registration failed (${etsRtsRes.status}): ${errText.slice(0, 200)}`);
     } else {
-      console.log(`  RTS key registered in ETS: ${rtsPublicKeyId}`);
+      log(`  RTS key registered in ETS: ${rtsPublicKeyId}`);
     }
   }
 
@@ -510,35 +484,27 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
     const [ctsEncRes, etsEncRes] = await Promise.all([
       fetch(kdcSignUrl, {
         method: "POST",
-        headers: {
-          ...commonHeaders(webOrigin),
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
+        headers: { ...commonHeaders(webOrigin), Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
         body: rtsFallbackBody,
       }),
       fetch(`${etsBaseUrl}/api/v2/kdc/keys/${userHuid}`, {
         method: "POST",
-        headers: {
-          ...commonHeaders(webOrigin),
-          Authorization: `Bearer ${etsAuthToken}`,
-          "Content-Type": "application/json",
-        },
+        headers: { ...commonHeaders(webOrigin), Authorization: `Bearer ${etsAuthToken}`, "Content-Type": "application/json" },
         body: rtsFallbackBody,
       }),
     ]);
 
     if (!ctsEncRes.ok) {
       const errText = await ctsEncRes.text().catch(() => "");
-      console.log(`  Warning: CTS fallback RTS key registration failed (${ctsEncRes.status}): ${errText.slice(0, 200)}`);
+      log(`  Warning: CTS fallback RTS key registration failed (${ctsEncRes.status}): ${errText.slice(0, 200)}`);
     } else {
-      console.log(`  Fallback encryption key registered in CTS: ${rtsPublicKeyId}`);
+      log(`  Fallback encryption key registered in CTS: ${rtsPublicKeyId}`);
     }
     if (!etsEncRes.ok) {
       const errText = await etsEncRes.text().catch(() => "");
-      console.log(`  Warning: ETS fallback RTS key registration failed (${etsEncRes.status}): ${errText.slice(0, 200)}`);
+      log(`  Warning: ETS fallback RTS key registration failed (${etsEncRes.status}): ${errText.slice(0, 200)}`);
     } else {
-      console.log(`  Fallback encryption key registered in ETS: ${rtsPublicKeyId}`);
+      log(`  Fallback encryption key registered in ETS: ${rtsPublicKeyId}`);
     }
   }
 
@@ -549,26 +515,16 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
     try {
       rtsAuthToken = decryptRtsToken(encryptedRtsToken, serverPublicKey, rtsPrivateKey);
       setRtsAuthToken(rtsAuthToken);
-      if (process.env.EXPRESS_DEBUG) {
-        console.log(`  [DEBUG] Decrypted RTS auth token: ${rtsAuthToken.slice(0, 60)}...`);
-      }
-      console.log(`  RTS auth token decrypted from encrypted_rts_token`);
+      if (process.env.EXPRESS_DEBUG) log(`  [DEBUG] Decrypted RTS auth token: ${rtsAuthToken.slice(0, 60)}...`);
+      log(`  RTS auth token decrypted from encrypted_rts_token`);
     } catch (err) {
-      console.log(`  Warning: could not decrypt encrypted_rts_token: ${(err as Error).message}`);
+      log(`  Warning: could not decrypt encrypted_rts_token: ${(err as Error).message}`);
     }
   }
 
   const rtsIdFromToken = extractRtsKeyIdFromToken(accessToken);
-  if (rtsIdFromToken && process.env.EXPRESS_DEBUG) {
-    console.log(`  [DEBUG] rts_id from CTS token: ${rtsIdFromToken}`);
-  }
+  if (rtsIdFromToken && process.env.EXPRESS_DEBUG) log(`  [DEBUG] rts_id from CTS token: ${rtsIdFromToken}`);
 
-  // CTS encryption key for E2E messages. eXpress keeps ONE active cts key per
-  // user (shared across devices via the QR handshake / key backup). Priority:
-  //  1. the cts key the phone sent through registration_data (the shared account
-  //     key) — this makes QR login self-sufficient, no import needed;
-  //  2. the stored ctsKey (already-shared key from a prior import/login);
-  //  3. mint a new one — only when the account genuinely has no cts key yet.
   const existingCts = loadApigwKeys()?.ctsKey;
   let ctsKey: ApigwKeys["ctsKey"];
 
@@ -578,25 +534,22 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
       privateKey: qrCtsPrivateKey,
       publicKey: nacl.box.keyPair.fromSecretKey(qrCtsPrivateKey).publicKey,
     };
-    console.log(`  Using CTS key from QR handshake: ${qrCtsKeyId.slice(0, 8)}... (shared account key)`);
+    log(`  Using CTS key from QR handshake: ${qrCtsKeyId.slice(0, 8)}... (shared account key)`);
   } else if (existingCts) {
     ctsKey = existingCts;
-    console.log(`  Reusing existing CTS key: ${existingCts.keyId.slice(0, 8)}... (not re-registering)`);
+    log(`  Reusing existing CTS key: ${existingCts.keyId.slice(0, 8)}... (not re-registering)`);
   } else {
-    // Guard: if the account already has a current cts key in KDC, DO NOT mint a
-    // new one — it would supersede the shared key and, since the CLI can't upload
-    // the private-key backup, permanently break your phone/desktop/web.
     const currentCts = await fetchCurrentAccountCtsKey(getBaseUrl(config), accessToken, userHuid, webOrigin);
     if (currentCts) {
       throw new Error(
         `Account already has a shared CTS key (${currentCts}) that this CLI doesn't hold.\n` +
         `Minting a new one would break your other devices (they can't fetch its private key).\n` +
         `Instead, extract the key from a logged-in web client (IndexedDB authState → encryptionKeys → user.privateKeys.cts) and run:\n` +
-        `  express auth import-cts <private_key_b64> ${currentCts}\n` +
+        `  express-cli auth import-cts <private_key_b64> ${currentCts}\n` +
         `Then re-run login, or just use 'auth refresh' for tokens.`,
       );
     }
-    console.log("  No existing account CTS key found — minting a new one (first device).");
+    log("  No existing account CTS key found — minting a new one (first device).");
     const ctsKeyPair = nacl.box.keyPair();
     const ctsKeyId = crypto.randomUUID();
     const ctsKeyPubB64 = Buffer.from(ctsKeyPair.publicKey).toString("base64");
@@ -604,19 +557,15 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
 
     const ctsCtsKeyRes = await fetch(kdcSignUrl, {
       method: "POST",
-      headers: {
-        ...commonHeaders(webOrigin),
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
+      headers: { ...commonHeaders(webOrigin), Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
       body: ctsKeyBody,
     });
 
     if (!ctsCtsKeyRes.ok) {
       const errText = await ctsCtsKeyRes.text().catch(() => "");
-      console.log(`  Warning: CTS encryption key registration failed (${ctsCtsKeyRes.status}): ${errText.slice(0, 200)}`);
+      log(`  Warning: CTS encryption key registration failed (${ctsCtsKeyRes.status}): ${errText.slice(0, 200)}`);
     } else {
-      console.log(`  CTS encryption key registered: ${ctsKeyId.slice(0, 8)}...`);
+      log(`  CTS encryption key registered: ${ctsKeyId.slice(0, 8)}...`);
     }
 
     ctsKey = {
@@ -639,7 +588,7 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
   };
   saveApigwKeys(apigwKeys);
 
-  console.log("\nStep 6/7: Activating apigw via ETS...");
+  log("\nStep 6: Activating apigw via ETS...");
 
   const activationUrl = `${etsBaseUrl}/api/v1/apigw/api/v1/authentication/activation`;
   const activationBody = JSON.stringify({
@@ -671,15 +620,32 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
 
   if (!activationRes.ok) {
     const actErrText = await activationRes.text().catch(() => "");
-    console.log(`  Warning: apigw activation failed (${activationRes.status}): ${actErrText.slice(0, 200)}`);
+    log(`  Warning: apigw activation failed (${activationRes.status}): ${actErrText.slice(0, 200)}`);
   } else {
-    console.log("  Apigw activated.");
+    log("  Apigw activated.");
   }
 
-  console.log(`\n  User HUID: ${userHuid || "unknown"}`);
-  console.log(`  Signing key: ${apigwSigningKey.keyId.slice(0, 8)}...`);
-  console.log(`  Encryption key: ${rtsPublicKeyId.slice(0, 8)}...`);
-  console.log(`  Server key: ${serverPublicKeyId.slice(0, 8)}...`);
+  log(`\n  User HUID: ${userHuid || "unknown"}`);
+  log(`  Signing key: ${apigwSigningKey.keyId.slice(0, 8)}...`);
+  log(`  Encryption key: ${rtsPublicKeyId.slice(0, 8)}...`);
+  log(`  Server key: ${serverPublicKeyId.slice(0, 8)}...`);
 
-  console.log("\nQR login complete! You are now authenticated.");
+  log("\nQR login complete! You are now authenticated.");
+}
+
+// ─── CLI entry point ──────────────────────────────────────────────────────────
+
+export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void> {
+  const mat = buildQrMaterial(cliOverrides);
+
+  console.log("Step 1/6: Scan this QR code with your eXpress app:\n");
+  qrcode.generate(mat.qrPayload, { small: true }, (qr: string) => {
+    console.log(qr);
+  });
+  console.log(`\n  registration_id: ${mat.registrationId}`);
+  console.log("  Waiting for scan (server long-polling)...\n");
+  openQrInBrowser(mat.qrPayload, mat.registrationId).catch(() => {});
+
+  const pollResult = await pollForQrScan(mat);
+  await completeQrRegistration(mat, pollResult);
 }

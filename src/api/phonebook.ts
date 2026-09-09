@@ -78,9 +78,9 @@ export class PhonebookApi {
       `/api/v3/phonebook/search?query=${encodeURIComponent(query)}&active=true&disable_fuzzy_search=false`,
     );
     if (!data || typeof data !== "object") return [];
+    // client.get already unwraps `result`, so data is {phonebook: [...]} directly
     const obj = data as Record<string, unknown>;
-    const result = obj.result as Record<string, unknown> | undefined;
-    const phonebook = (result?.phonebook ?? []) as Array<{ name?: string; contacts?: Array<{ user_huid?: string }> }>;
+    const phonebook = (obj.phonebook ?? []) as Array<{ name?: string; contacts?: Array<{ user_huid?: string }> }>;
     const huids = [
       ...new Set(
         phonebook

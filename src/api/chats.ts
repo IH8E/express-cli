@@ -1,8 +1,9 @@
 import { ApiClient } from "./client.js";
-import { fetchChatListViaWebSocket } from "./websocket.js";
+import { fetchChatListViaWebSocket, createPersonalChatViaWebSocket } from "./websocket.js";
 import { getAuthToken } from "../config/store.js";
 import { loadApigwKeys } from "../auth/keys.js";
 import { loadConfig, getBaseUrl } from "../config/index.js";
+import { UserApi } from "./user.js";
 import type { ExpressChat } from "../types/index.js";
 
 interface DirectoryEntry {
@@ -68,5 +69,17 @@ export class ChatsApi {
       chat_ids: [chatId],
     });
     return data?.open_chats?.[0] ?? null;
+  }
+
+  async createDm(targetHuid: string): Promise<string> {
+    const config = loadConfig();
+    const host = new URL(getBaseUrl(config)).hostname;
+    const ctsToken = getAuthToken();
+    const keys = loadApigwKeys();
+    const encryptionKeyId = (keys?.ctsKey ?? keys?.encryptionKey)?.keyId;
+    if (!ctsToken || !encryptionKeyId) throw new Error("Not authenticated");
+
+    const myHuid = (await new UserApi(this.client).getSelfProfile()).user_huid;
+    return createPersonalChatViaWebSocket({ host, ctsToken, encryptionKeyId, myHuid, targetHuid });
   }
 }

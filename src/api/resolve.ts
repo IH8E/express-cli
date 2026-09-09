@@ -1,6 +1,7 @@
 import { ApiClient } from "./client.js";
 import { ChatsApi } from "./chats.js";
 import { UserApi } from "./user.js";
+import { PhonebookApi } from "./phonebook.js";
 import type { ExpressChat } from "../types/index.js";
 
 /** List chats with DM display names resolved to the other participant's full name. */
@@ -24,17 +25,32 @@ export async function listChatsWithNames(client: ApiClient): Promise<ExpressChat
   return chats;
 }
 
-/** Resolve a chat name (partial match) or UUID to a full chat_id. Throws on 0/many matches. */
+/** Resolve a chat name (partial match) or UUID to a full chat_id.
+ *  If no existing DM matches and the query looks like a person's name,
+ *  searches the phonebook and auto-creates a DM. Throws on ambiguity. */
 export async function resolveChatId(client: ApiClient, chatIdOrName: string): Promise<string> {
   if (/^[0-9a-f-]{36}$/i.test(chatIdOrName)) return chatIdOrName;
 
   const chats = await listChatsWithNames(client);
   const lower = chatIdOrName.toLowerCase();
   const matches = chats.filter((c) => (c.name ?? "").toLowerCase().includes(lower));
-  if (matches.length === 0) throw new Error(`No chat found matching "${chatIdOrName}"`);
+  if (matches.length === 1) return matches[0].group_chat_id;
   if (matches.length > 1) {
     const names = matches.map((c) => `  ${c.name} (${c.group_chat_id})`).join("\n");
     throw new Error(`Multiple chats match "${chatIdOrName}":\n${names}\nUse the full chat ID.`);
   }
-  return matches[0].group_chat_id;
+
+  // No existing chat — try phonebook and auto-create DM
+  const results = await new PhonebookApi(client).searchUsers(chatIdOrName, 5);
+  if (results.length === 0) throw new Error(`No chat or contact found matching "${chatIdOrName}"`);
+  if (results.length > 1) {
+    const names = results.map((p) => `  ${p.name} (${p.user_huid})`).join("\n");
+    throw new Error(`No existing DM with "${chatIdOrName}", found multiple contacts:\n${names}\nBe more specific.`);
+  }
+
+  const person = results[0];
+  process.stderr.write(`No DM with "${person.name}" — creating one...\n`);
+  const chatId = await new ChatsApi(client).createDm(person.user_huid);
+  process.stderr.write(`DM created: ${chatId}\n`);
+  return chatId;
 }
