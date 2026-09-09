@@ -89,8 +89,9 @@ export class ApiClient {
           const retryRes = await fetch(url, { ...options, headers: newHeaders });
           return this.handleResponse<T>(retryRes);
         }
+        throw new Error("Token expired and refresh failed. Please re-authenticate with `express auth qr`.");
       }
-      throw new Error("Token expired and refresh failed. Please re-authenticate with `express auth qr`.");
+      throw new Error(`API error 401: ${res.statusText}${text ? ` — ${text.slice(0, 200)}` : ""}`);
     }
 
     return this.handleResponse<T>(res);
