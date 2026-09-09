@@ -1,6 +1,6 @@
 {
   "name": "@ih8e/express-cli",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "CLI/TUI/MCP client for eXpress Chat",
   "license": "MIT",
   "keywords": [
