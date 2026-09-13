@@ -16,7 +16,8 @@ import { buildQrMaterial, pollForQrScan, completeQrRegistration } from "../auth/
 import { openQrInBrowser } from "../auth/qr-browser.js";
 import { ExpressSession, type SessionMessage } from "../session/session.js";
 import type { ExpressChat } from "../types/index.js";
-import qrcode from "qrcode-terminal";
+import QRCode from "qrcode";
+import packageJson from "../../package.json" with { type: "json" };
 
 const AUTH_INSTRUCTION = "Run 'express-cli auth qr' (or 'npx @ih8e/express-cli auth qr') in a terminal to log in.";
 
@@ -39,7 +40,7 @@ interface Incoming { seq: number; chatId: string; sender: string; body: string; 
 
 /** Buffers incoming messages so `wait_for_messages` can hand an agent everything
  * new since its last call, blocking up to a timeout when nothing is pending. */
-class Inbox {
+export class Inbox {
   private buf: Incoming[] = [];
   private seq = 0;
   private cursor = 0;
@@ -69,31 +70,18 @@ class Inbox {
 }
 
 
-/**
- * MCP server (stdio) exposing eXpress chat over the existing api layer. Reuses the
- * same E2E send/read code as the CLI, so nothing is duplicated. stdout carries only
- * the MCP protocol (the request/refresh path is free of stdout logging).
- */
-export async function runMcpServer(): Promise<void> {
-  const server = new McpServer({ name: "express-cli", version: "0.1.0" });
+export interface McpToolDeps {
+  session: ExpressSession | null;
+  inbox: Inbox;
+  chatNames: Map<string, string>;
+  senderNames: Map<string, string>;
+  isSessionReady: () => boolean;
+}
 
-  // Persistent session that buffers incoming messages for wait_for_messages.
-  const inbox = new Inbox();
-  const chatNames = new Map<string, string>();
-  const senderNames = new Map<string, string>();
-  let sessionReady = false;
-  let session: ExpressSession | null = null;
-  try {
-    session = new ExpressSession();
-    session.on("connected", () => { sessionReady = true; });
-    session.on("chats", (list: ExpressChat[]) => { for (const c of list) chatNames.set(c.group_chat_id, c.name?.trim() || c.group_chat_id.slice(0, 8)); });
-    session.on("message", (m: SessionMessage) => inbox.add(m));
-    session.connect().catch((err) => { process.stderr.write(`[mcp] session connect failed: ${(err as Error).message}\n`); });
-    // Resolve DM names in the background for nicer chat labels
-    listChatsWithNames(new ApiClient()).then((chats) => { for (const c of chats) chatNames.set(c.group_chat_id, c.name ?? c.group_chat_id.slice(0, 8)); }).catch(() => {});
-  } catch (err) {
-    process.stderr.write(`[mcp] session unavailable: ${(err as Error).message}\n`);
-  }
+/** Registers all express-cli tools on `server`. Split out from `runMcpServer` so tests
+ * can exercise tools over an in-memory transport without a live session/stdio transport. */
+export function registerTools(server: McpServer, deps: McpToolDeps): void {
+  const { session, inbox, chatNames, senderNames, isSessionReady } = deps;
 
   const enrich = async (items: Incoming[]) => {
     const unknown = [...new Set(items.map((i) => i.sender))].filter((h) => h && h.length >= 30 && !senderNames.has(h));
@@ -116,6 +104,7 @@ export async function runMcpServer(): Promise<void> {
     title: "List chats",
     description: "List chats (DMs, groups, channels) with names and full chat IDs. DM names are resolved to the person's full name.",
     inputSchema: { type: z.enum(["all", "dm", "group", "channel"]).optional().describe("Filter by chat type (default all)") },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async ({ type }) => {
     if (!await ensureAuth()) return notAuthenticated();
     const chats = await listChatsWithNames(new ApiClient());
@@ -128,6 +117,7 @@ export async function runMcpServer(): Promise<void> {
     title: "Find a chat by name",
     description: "Find chats whose name (person or group) contains the query. Returns name + full chat_id to use with other tools.",
     inputSchema: { query: z.string().describe("Part of the chat or person name") },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async ({ query }) => {
     if (!await ensureAuth()) return notAuthenticated();
     const chats = await listChatsWithNames(new ApiClient());
@@ -142,6 +132,7 @@ export async function runMcpServer(): Promise<void> {
       chat: z.string().describe("Chat name (partial ok) or full chat_id"),
       limit: z.number().int().min(1).max(200).optional().describe("How many recent messages (default 20)"),
     },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async ({ chat, limit }) => {
     if (!await ensureAuth()) return notAuthenticated();
     const client = new ApiClient();
@@ -158,6 +149,7 @@ export async function runMcpServer(): Promise<void> {
     title: "Send a message",
     description: "Send a text message to a chat, identified by name (partial ok) or chat_id. If no DM exists with that person, one is created automatically. Returns the sync_id.",
     inputSchema: { chat: z.string().describe("Chat name or full chat_id"), text: z.string().describe("Message text") },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   }, async ({ chat, text }) => {
     if (!await ensureAuth()) return notAuthenticated();
     const client = new ApiClient();
@@ -170,6 +162,7 @@ export async function runMcpServer(): Promise<void> {
     title: "Search employees",
     description: "Global company phonebook search across all employees by name.",
     inputSchema: { query: z.string().describe("Name to search"), limit: z.number().int().min(1).max(50).optional() },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async ({ query, limit }) => {
     if (!await ensureAuth()) return notAuthenticated();
     const profiles = await new PhonebookApi(new ApiClient()).searchUsers(query, limit ?? 20);
@@ -180,6 +173,7 @@ export async function runMcpServer(): Promise<void> {
     title: "My profile",
     description: "Get the authenticated user's own profile.",
     inputSchema: {},
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async () => {
     if (!await ensureAuth()) return notAuthenticated();
     return ok(await new UserApi(new ApiClient()).getSelfProfile());
@@ -189,16 +183,18 @@ export async function runMcpServer(): Promise<void> {
     title: "Wait for incoming messages",
     description: "Block until new incoming messages arrive (from any chat/discussion), then return them. Returns messages received since the previous call to this tool; if none are pending, waits up to timeout_seconds. Your own sent messages are not included. Use this to react to new messages instead of polling.",
     inputSchema: { timeout_seconds: z.number().int().min(1).max(120).optional().describe("Max seconds to wait when nothing is pending (default 30)") },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   }, async ({ timeout_seconds }) => {
     if (!session) return ok({ error: "Session unavailable.", instruction: AUTH_INSTRUCTION });
     const items = await inbox.take((timeout_seconds ?? 30) * 1000);
-    return ok({ connected: sessionReady, count: items.length, messages: await enrich(items) });
+    return ok({ connected: isSessionReady(), count: items.length, messages: await enrich(items) });
   });
 
   server.registerTool("status", {
     title: "Auth status",
     description: "Check authentication and access-token status. Call this first if other tools return not_authenticated.",
     inputSchema: {},
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, async () => {
     const exp = getTokenExpiresAt();
     return ok({
@@ -233,13 +229,13 @@ export async function runMcpServer(): Promise<void> {
       "Do NOT run auth_qr_poll as a shell command — it is an MCP tool. " +
       "Use when status reports not_authenticated.",
     inputSchema: {},
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   }, async () => {
     const material = buildQrMaterial();
 
-    let qrAscii = "";
-    qrcode.generate(material.qrPayload, { small: true }, (qr: string) => { qrAscii = qr; });
+    const qrAscii = await QRCode.toString(material.qrPayload, { type: "terminal", small: true });
 
-    writeFileSync(join(tmpdir(), "express-qr.txt"), qrAscii, "utf8");
+    writeFileSync(join(tmpdir(), "express-qr.txt"), qrAscii, { encoding: "utf8", mode: 0o600 });
     process.stderr.write("\n" + qrAscii + "\n");
     openQrInBrowser(material.qrPayload, material.registrationId).catch(() => {});
 
@@ -256,7 +252,7 @@ export async function runMcpServer(): Promise<void> {
       qrPayload: material.qrPayload,
       qrBody: material.qrBody,
     };
-    writeFileSync(QR_MATERIAL_FILE, JSON.stringify(persistent), "utf8");
+    writeFileSync(QR_MATERIAL_FILE, JSON.stringify(persistent), { encoding: "utf8", mode: 0o600 });
 
     pendingQrMaterial = material;
     pendingQrPoll = pollForQrScan(material).catch((err) => {
@@ -281,6 +277,7 @@ export async function runMcpServer(): Promise<void> {
       "Waits up to 90 s for the server handshake, then saves tokens and keys. " +
       "IMPORTANT: call this as an MCP tool, not as a shell command.",
     inputSchema: {},
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   }, async () => {
     let material = pendingQrMaterial;
     let poll = pendingQrPoll;
@@ -326,6 +323,38 @@ export async function runMcpServer(): Promise<void> {
       return ok(`Login failed: ${(err as Error).message}`);
     }
   });
+}
+
+/**
+ * MCP server (stdio) exposing eXpress chat over the existing api layer. Reuses the
+ * same E2E send/read code as the CLI, so nothing is duplicated. stdout carries only
+ * the MCP protocol (the request/refresh path is free of stdout logging).
+ */
+export async function runMcpServer(): Promise<void> {
+  const server = new McpServer({ name: "express-cli", version: packageJson.version });
+
+  // Persistent session that buffers incoming messages for wait_for_messages.
+  const inbox = new Inbox();
+  const chatNames = new Map<string, string>();
+  const senderNames = new Map<string, string>();
+  let sessionReady = false;
+  let session: ExpressSession | null = null;
+  try {
+    session = new ExpressSession();
+    session.on("connected", () => { sessionReady = true; });
+    session.on("chats", (list: ExpressChat[]) => { for (const c of list) chatNames.set(c.group_chat_id, c.name?.trim() || c.group_chat_id.slice(0, 8)); });
+    session.on("message", (m: SessionMessage) => inbox.add(m));
+    // EventEmitter throws on an unhandled "error" event — without this listener a single
+    // decrypt failure on an incoming push (session.ts) would crash the whole MCP process.
+    session.on("error", (err: Error) => { process.stderr.write(`[mcp] session error: ${err.message}\n`); });
+    session.connect().catch((err) => { process.stderr.write(`[mcp] session connect failed: ${(err as Error).message}\n`); });
+    // Resolve DM names in the background for nicer chat labels
+    listChatsWithNames(new ApiClient()).then((chats) => { for (const c of chats) chatNames.set(c.group_chat_id, c.name ?? c.group_chat_id.slice(0, 8)); }).catch(() => {});
+  } catch (err) {
+    process.stderr.write(`[mcp] session unavailable: ${(err as Error).message}\n`);
+  }
+
+  registerTools(server, { session, inbox, chatNames, senderNames, isSessionReady: () => sessionReady });
 
   await server.connect(new StdioServerTransport());
 }

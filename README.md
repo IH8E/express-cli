@@ -49,19 +49,67 @@ express-cli auth refresh   # обновить токен (ключи не тро
 
 > Важно: не запускайте `auth qr` без нужды на разных устройствах бесконтрольно — модель ключей рассчитана на один общий cts-ключ на аккаунт. Подробности и все нюансы E2E — в [`AGENTS.md`](./AGENTS.md).
 
+Другие подкоманды: `auth login` (полный device-логин с ed25519-подписью для apigw),
+`auth import <token>` (импорт Bearer-токена из браузера), `auth import-cts <priv_b64> <key_id>`
+(ручной импорт общего CTS-ключа), `auth logout` (удалить токен и ключи).
+
 ## CLI
 
+Команды, которые ходят в API, принимают `--host <host>` (иначе — `EXPRESS_HOST` или
+сохранённый `config.host`); большинство также поддерживают `-o, --output table|json`.
+
 ```bash
-express-cli chats list [--type dm|group|channel]   # список чатов (ФИО для личек)
-express-cli chats find "Иванов"                     # найти чат → полный UUID
-express-cli messages list <chat-id> [--limit N]     # прочитать и расшифровать
-express-cli send message "Иванов" "Привет!"         # отправить (по имени или UUID)
-express-cli send file "Иванов" ./report.pdf         # отправить файл
-express-cli contacts search "Петров"                # глобальный поиск сотрудников
-express-cli contacts self                           # свой профиль
+# Чаты
+express-cli chats list [--type dm|group|channel]     # список чатов (ФИО для личек)
+express-cli chats find "Иванов" [--type ...]         # найти чат → полный UUID
+express-cli chats info <chat-id>                     # детали чата
+
+# Сообщения
+express-cli messages list <chat-id> [--limit N]      # прочитать и расшифровать
+express-cli send message "Иванов" "Привет!"          # отправить (по имени или UUID)
+express-cli send file "Иванов" ./report.pdf [--caption "..."]  # отправить файл (изображения)
+express-cli listen [--activity] [--avatar]           # стрим входящих сообщений в терминал
+
+# Контакты
+express-cli contacts self                            # свой профиль
+express-cli contacts query <huid...>                 # профили по HUID
+express-cli contacts search "Петров" [--limit N]     # глобальный поиск сотрудников
+express-cli contacts list                            # контакты (нужен `auth login`)
+express-cli contacts directory [--since <iso-date>]  # записи корпоративного справочника
+
+# Статусы
+express-cli status self [--short]                    # свой статус
+express-cli status get <huid...> [--short]           # статусы по HUID
+express-cli status history [--since <iso-date>]      # история статусов
+
+# Аватарки и файлы
+express-cli avatar self [-o <path>]                  # скачать свою аватарку
+express-cli avatar get <huid> [-o <path>]            # скачать чужую аватарку
+express-cli download <url> [-o <path>]               # скачать файл из uploads
+
+# Сервер, конфиг, произвольные запросы
+express-cli settings meta                            # метаданные сервера
+express-cli settings get [--since <iso-date>]        # настройки сервера
+express-cli config get [key] | set <key> <value> | list | reset
+express-cli api <path> [-X <method>] [-d '<json>']   # произвольный запрос к API
 ```
 
-Большинство команд поддерживают `--output json` для пайплайнов.
+`listen` — персистентная сессия, печатает входящие по мере поступления (ФИО отправителя
+и `@упоминания` резолвятся в имена, `@all` — как «all»); `--activity` добавляет сырые
+события до расшифровки, `--avatar` показывает превью аватарки при первом сообщении от
+каждого отправителя.
+
+### Переменные окружения
+
+Переопределяют сохранённый конфиг (`express-cli config get`), кроме `EXPRESS_DEBUG`:
+
+| Переменная | Назначение |
+| --- | --- |
+| `EXPRESS_HOST` | хост eXpress (аналог `--host`) |
+| `EXPRESS_TOKEN` | Bearer-токен вместо сохранённого |
+| `EXPRESS_LOCALE` | локаль запросов (по умолчанию `ru`) |
+| `EXPRESS_OUTPUT` | формат вывода по умолчанию (`table`/`json`) |
+| `EXPRESS_DEBUG` | подробный лог подписи apigw-запросов (в stderr) |
 
 ## TUI
 
@@ -86,8 +134,11 @@ node /абсолютный/путь/dist/index.js mcp
 ```
 
 Инструменты: `chats_list`, `chats_find`, `messages_list`, `send_message`,
-`contacts_search`, `contacts_self`, `wait_for_messages`, `status`.
+`contacts_search`, `contacts_self`, `wait_for_messages`, `status`,
+`auth_qr_start`, `auth_qr_poll`.
 `wait_for_messages` блокируется до новых входящих (для реакции без поллинга).
+`auth_qr_start`/`auth_qr_poll` — QR-логин прямо из MCP-клиента, когда `status`
+сообщает `not_authenticated`.
 
 ## Архитектура
 
@@ -111,6 +162,7 @@ src/
 npm run build      # сборка (tsup)
 npm run dev        # watch-сборка
 npm run lint       # tsc --noEmit (есть остаточные предупреждения типов)
+npm test           # node:test через tsx, без сети — MCP-тулы, Inbox, QR-материал
 ```
 
 Глубокая техническая документация по протоколу eXpress, модели ключей и E2E —

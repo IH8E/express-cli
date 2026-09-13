@@ -108,11 +108,11 @@ export async function signApigwRequest(params: {
   );
 
   if (process.env.EXPRESS_DEBUG) {
-    console.log(`  [DEBUG] path: ${path}`);
-    console.log(`  [DEBUG] signedHeaders: ${signedHeaders}`);
-    console.log(`  [DEBUG] signingString:\n${signingString}`);
-    console.log(`  [DEBUG] signingKey keyId: ${keys.signingKey.keyId}`);
-    console.log(`  [DEBUG] encryptionKey keyId: ${keys.encryptionKey.keyId}`);
+    console.error(`  [DEBUG] path: ${path}`);
+    console.error(`  [DEBUG] signedHeaders: ${signedHeaders}`);
+    console.error(`  [DEBUG] signingString:\n${signingString}`);
+    console.error(`  [DEBUG] signingKey keyId: ${keys.signingKey.keyId}`);
+    console.error(`  [DEBUG] encryptionKey keyId: ${keys.encryptionKey.keyId}`);
   }
 
   const signature = signEd25519(keys.signingKey.privateKey, new TextEncoder().encode(signingString));
@@ -131,7 +131,7 @@ export async function signApigwRequest(params: {
       if (kdcStartData.result) {
         serverPublicKey = new Uint8Array(Buffer.from(kdcStartData.result, "base64"));
         if (process.env.EXPRESS_DEBUG) {
-          console.log(`  [DEBUG] ETS server public key (curve25519): ${kdcStartData.result}`);
+          console.error(`  [DEBUG] ETS server public key (curve25519): ${kdcStartData.result}`);
         }
         keys.serverPublicKey = serverPublicKey;
         keys.serverPublicKeyId = "kdc-start-ets";
@@ -146,14 +146,14 @@ export async function signApigwRequest(params: {
   const encryptedToken = encryptToken(tokenToEncrypt, serverPublicKey, keys.encryptionKey.privateKey);
 
   if (process.env.EXPRESS_DEBUG) {
-    console.log(`  [DEBUG] ctsToken length: ${params.ctsToken.length}`);
-    console.log(`  [DEBUG] rtsToken: ${params.rtsToken ? `present (${params.rtsToken.length} chars)` : "not set"}`);
-    console.log(`  [DEBUG] etsAuthToken: ${params.etsAuthToken ? `present (${params.etsAuthToken.length} chars)` : "not set"}`);
-    console.log(`  [DEBUG] tokenToEncrypt: ${tokenToEncrypt.length} chars (source: ${params.etsAuthToken ? 'etsAuthToken' : params.rtsToken ? 'rtsToken' : 'ctsToken'})`);
-    console.log(`  [DEBUG] serverPublicKey b64: ${Buffer.from(serverPublicKey).toString("base64")}`);
-    console.log(`  [DEBUG] encryptionPrivateKey b64: ${Buffer.from(keys.encryptionKey.privateKey).toString("base64")}`);
-    console.log(`  [DEBUG] encryptionPublicKey b64: ${Buffer.from(keys.encryptionKey.publicKey).toString("base64")}`);
-    console.log(`  [DEBUG] encryptedToken length: ${encryptedToken.length}`);
+    console.error(`  [DEBUG] ctsToken length: ${params.ctsToken.length}`);
+    console.error(`  [DEBUG] rtsToken: ${params.rtsToken ? `present (${params.rtsToken.length} chars)` : "not set"}`);
+    console.error(`  [DEBUG] etsAuthToken: ${params.etsAuthToken ? `present (${params.etsAuthToken.length} chars)` : "not set"}`);
+    console.error(`  [DEBUG] tokenToEncrypt: ${tokenToEncrypt.length} chars (source: ${params.etsAuthToken ? 'etsAuthToken' : params.rtsToken ? 'rtsToken' : 'ctsToken'})`);
+    console.error(`  [DEBUG] serverPublicKey b64: ${Buffer.from(serverPublicKey).toString("base64")}`);
+    console.error(`  [DEBUG] encryptionPrivateKey b64: ${Buffer.from(keys.encryptionKey.privateKey).toString("base64")}`);
+    console.error(`  [DEBUG] encryptionPublicKey b64: ${Buffer.from(keys.encryptionKey.publicKey).toString("base64")}`);
+    console.error(`  [DEBUG] encryptedToken length: ${encryptedToken.length}`);
   }
 
   return {
@@ -198,9 +198,9 @@ export function signQrRequest(params: {
   const signatureBase64 = Buffer.from(signature).toString("base64");
 
   if (process.env.EXPRESS_DEBUG) {
-    console.log(`  [DEBUG QR] path: ${path}`);
-    console.log(`  [DEBUG QR] signedHeaders: ${signedHeaders}`);
-    console.log(`  [DEBUG QR] signingString:\n${signingString}`);
+    console.error(`  [DEBUG QR] path: ${path}`);
+    console.error(`  [DEBUG QR] signedHeaders: ${signedHeaders}`);
+    console.error(`  [DEBUG QR] signingString:\n${signingString}`);
   }
 
   return {

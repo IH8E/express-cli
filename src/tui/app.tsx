@@ -8,6 +8,7 @@ import { UserApi } from "../api/user.js";
 import { ApiClient } from "../api/client.js";
 import { renderImage } from "./image.js";
 import type { ImageAttachment } from "../api/decrypt.js";
+import { ALL_MENTION_HUID, MENTION_RE } from "../api/mentions.js";
 import type { ExpressChat } from "../types/index.js";
 
 interface DisplayMsg {
@@ -30,7 +31,6 @@ const clock = (iso: string) => {
   return Number.isNaN(d.getTime()) ? "--:--" : d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
 };
 
-const MENTION_RE = /@\{mention:([0-9a-fA-F-]{36})\}/g;
 type Seg = { mention?: string; text?: string };
 function parseBody(body: string): Seg[] {
   const out: Seg[] = [];
@@ -97,7 +97,7 @@ export function App() {
   const activeMessages = openThreadId ? messages[openThreadId] : (currentId ? messages[currentId] : undefined);
 
   const resolveHuids = (huids: string[]) => {
-    const need = [...new Set(huids)].filter((h) => h && h.length >= 30 && !requested.current.has(h));
+    const need = [...new Set(huids)].filter((h) => h && h.length >= 30 && h !== ALL_MENTION_HUID && !requested.current.has(h));
     if (need.length === 0) return;
     need.forEach((h) => requested.current.add(h));
     new UserApi(new ApiClient()).getProfilesByHuid(need)
@@ -119,6 +119,9 @@ export function App() {
 
   const senderLabel = (huid: string): string =>
     huid === selfHuid || huid === "me" ? "you" : names[huid] || shortHuid(huid);
+
+  const mentionName = (huid: string): string =>
+    huid === ALL_MENTION_HUID ? "all" : names[huid] || shortHuid(huid);
 
   // A thread's title = its root (oldest) message
   const fetchThreadTitle = (threadId: string) => {
@@ -271,7 +274,7 @@ export function App() {
 
   const estLines = (m: DisplayMsg): number => {
     let n = 9 + senderLabel(m.sender).length + 2;
-    for (const seg of parseBody(m.body)) n += seg.mention ? 1 + (names[seg.mention]?.length ?? 8) : (seg.text?.length ?? 0);
+    for (const seg of parseBody(m.body)) n += seg.mention ? 1 + mentionName(seg.mention).length : (seg.text?.length ?? 0);
     return Math.max(1, Math.ceil(n / rightWidth));
   };
   let threadStart = activeMessages ? activeMessages.length : 0;
@@ -285,7 +288,7 @@ export function App() {
   const renderBody = (m: DisplayMsg) =>
     parseBody(m.body).map((seg, i) =>
       seg.mention
-        ? <Text key={i} color="magenta">@{names[seg.mention] || shortHuid(seg.mention)}</Text>
+        ? <Text key={i} color="magenta">@{mentionName(seg.mention)}</Text>
         : <Text key={i}>{seg.text}</Text>,
     );
 

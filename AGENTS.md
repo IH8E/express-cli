@@ -12,15 +12,18 @@ node ./dist/index.js <command>
 ## Аутентификация
 
 ```bash
+node ./dist/index.js auth qr               # QR-логин (сканируется мобильным приложением)
 node ./dist/index.js auth refresh          # обновить токен
-node ./dist/index.js auth login            # QR-логин (открывает браузер)
 node ./dist/index.js auth status           # проверить статус токена
 ```
+
+`auth login` — отдельный от QR device-логин (ed25519-подпись для apigw-эндпоинтов), не путать с `auth qr`.
+Остальные подкоманды (`import`, `import-cts`, `logout`) и полный список команд CLI — в [`README.md`](./README.md#cli).
 
 ## Чаты
 
 ```bash
-node ./dist/index.js chats list                        # все 55 чатов (DM, group, channel)
+node ./dist/index.js chats list                        # все чаты (DM, group, channel)
 node ./dist/index.js chats list --type dm              # только личные переписки
 node ./dist/index.js chats list --type group           # только группы
 node ./dist/index.js chats find "Павленко"             # найти чат по имени → полный UUID
@@ -68,12 +71,16 @@ node ./dist/index.js status history                    # история стат
 
 Тонкая обёртка над `src/api/*` — те же E2E send/read, что и CLI (без дублирования). stdio-транспорт (`@modelcontextprotocol/sdk`), stdout чистый (путь запроса/refresh не логирует в stdout).
 
-- `src/mcp/server.ts` — 8 инструментов: `chats_list`, `chats_find`, `messages_list`, `send_message`, `contacts_search`, `contacts_self`, `wait_for_messages`, `status`.
+- `src/mcp/server.ts` — 10 инструментов: `chats_list`, `chats_find`, `messages_list`, `send_message`, `contacts_search`, `contacts_self`, `wait_for_messages`, `status`, `auth_qr_start`, `auth_qr_poll`. Все с полными annotations (`readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`). Регистрация тулов вынесена в `registerTools()` — тесты (`src/mcp/server.test.ts`) вызывают её напрямую через `InMemoryTransport`, без реальной сессии/сети.
 - Резолв имени чата → uuid вынесен в `src/api/resolve.ts` (`resolveChatId`, `listChatsWithNames`) — общий с `cli/send.ts`.
 - `wait_for_messages`: сервер держит **одну живую `ExpressSession`**, буферизует входящие в `Inbox`; инструмент блокируется до новых сообщений (с прошлого вызова) или таймаута (`timeout_seconds`, дефолт 30). Отдаёт `{connected, count, messages:[{time, chat, chat_id, sender, message}]}` с резолвом имён чата/отправителя.
 - **ВАЖНО**: свои отправки (в т.ч. с телефона/веба) НЕ приходят пушем на другую сессию (сервер подавляет self-echo) → `wait_for_messages` ловит только сообщения от ДРУГИХ. Тестировать нужно сообщением от другого человека/аккаунта.
+- `auth_qr_start`/`auth_qr_poll` — QR-логин из MCP-клиента (когда `status` вернул `not_authenticated`). Материал пендинг-логина персистится в `os.tmpdir()` (переживает рестарт сервера) с правами `0o600`.
+- **ВАЖНО**: `session.on("error", ...)` обязателен — без листенера Node кидает необработанное исключение на любой `session.emit("error", ...)` (напр. сбой дешифровки пуша) и валит процесс.
+- **ВАЖНО**: `EXPRESS_DEBUG=1` не должен ничего писать в stdout при работе как MCP — весь debug-вывод (`src/auth/apigw-signer.ts`) идёт через `console.error` (stderr).
 - Запуск: `node ./dist/index.js mcp`. Регистрация в Claude Code: `claude mcp add express -- node <абс.путь>/dist/index.js mcp`.
 - Проверено реальным MCP-клиентом: handshake, list tools, `status`, `chats_find`, `messages_list` (WS+дешифровка), `wait_for_messages` (connected + таймаут-ветка).
+- Тесты: `npm test` (`node:test` через `tsx`, без сети/браузера — `EXPRESS_CLI_CONFIG_DIR` изолирует `conf`-стор от реального токена пользователя).
 - TODO: `send_file`, `threads_list`.
 
 ## Технические детали для агентов
@@ -90,7 +97,7 @@ node ./dist/index.js status history                    # история стат
 
 **WebSocket** (`wss://<host>/socket/user/websocket?vsn=1.0.0`):
 - Phoenix protocol: authenticate → chat_list / chat_info / message_new
-- Источник полного списка чатов (55 шт.)
+- Источник полного списка чатов
 - Реализован в `src/api/websocket.ts`
 
 **Отправка сообщений** (`src/api/messaging-ws.ts`):
@@ -117,7 +124,10 @@ node ./dist/index.js status history                    # история стат
 - **Одно соединение на key_id!** Сервер убивает старый сокет при появлении нового с тем же key_id. Раньше баг reconnect'а (двойное планирование в `onClose` + `scheduleReconnect`, события устаревших сокетов) плодил параллельные соединения → каскад закрытий `1006` («шторм»). Инварианты lifecycle (не сломать): (1) `connecting`-гвард + проверка `readyState` — не открывать второй сокет; (2) все обработчики сокета проверяют `if (this.ws !== ws) return` — игнор устаревших; (3) единственный `reconnectTimer` (гвард `if (this.reconnectTimer) return`); (4) `handleClose` — ЕДИНСТВЕННЫЙ, кто вызывает `scheduleReconnect` (openSocket при ошибке закрывает сокет → close → handleClose). Проверено: 40с = 1 connected, 0 disconnect.
 - Подписываемся только на `chat_type ∈ {chat, group_chat, channel, notes}`; `global`/`voex_call` отвечают `unmatched topic` — пропускаем. Подписки параллельны (`Promise.allSettled`), тихо игнорируют сбой при закрытии (переподписка на reconnect).
 - **Self-echo подавляется сервером**: сообщение, отправленное с одной сессии, НЕ приходит пушем на другую сессию того же юзера. Значит `listen`/TUI показывают входящие от ДРУГИХ; свои отправки TUI должен рисовать оптимистично сам. Живой пуш проверяется сообщением от собеседника.
-- Демо/smoke-тест: `express listen [--activity]` (`src/cli/listen.ts`) — стримит входящие. Требует валидный токен (`auth qr`).
+- Демо/smoke-тест: `express listen [--activity] [--avatar]` (`src/cli/listen.ts`) — стримит входящие. Требует валидный токен (`auth qr`).
+  - Резолвит ФИО отправителя (`UserApi.getProfilesByHuid`, кэш по huid, промис-per-huid — не кэширует неудачный лукап, чтобы транзиентный сбой не «замораживал» имя навсегда) и `@{mention:<huid>}` в теле (общая логика с TUI — `ALL_MENTION_HUID`/`MENTION_RE` вынесены в `src/api/mentions.ts`; `ALL_MENTION_HUID` — зарезервированный huid широковещательного `@all`, рендерится как «all», профиль под него не запрашивается).
+  - Обработка входящих сообщений идёт цепочкой промисов (`messageQueue`), а не `void handleMessage(m)` — иначе гонка асинхронных лукапов профиля могла напечатать сообщения не в порядке прихода.
+  - `--avatar`: при первом сообщении от каждого отправителя скачивает и рендерит превью аватарки (`terminal-image`, `preferNativeRender:true` — в отличие от TUI, здесь можно смешивать нативную графику терминала с обычным построчным выводом).
 
 **TUI** (`src/tui/app.tsx` + `src/cli/tui.ts`, команда `express tui`) — Ink 7 + React 19:
 - Слева список чатов (навигация ↑/↓, окно-viewport), справа тред выбранного чата, снизу инпут.
@@ -127,7 +137,7 @@ node ./dist/index.js status history                    # история стат
 - Непрочитанные: счётчик на чат (инкремент на `message`, если чат не открыт; сброс при открытии), в списке `(n)` + bold/cyan.
 - `useInput` под `{ isActive: isRawModeSupported }` — не падает в не-TTY. Рендер-тест: `ink-testing-library` (devDep) через esbuild-бандл компонента.
 - Сборка `.tsx`: tsup/esbuild + `jsx: react-jsx` в tsconfig; ink/react — external, резолвятся из node_modules в рантайме.
-- Mentions: тело содержит `@{mention:<huid>}` — `parseBody`/`renderBody` рендерят как `@Имя` (magenta), huid резолвятся в кэш имён.
+- Mentions: тело содержит `@{mention:<huid>}` — `parseBody`/`renderBody` рендерят как `@Имя` (magenta), huid резолвятся в кэш имён. `ALL_MENTION_HUID` (`src/api/mentions.ts`, общий с `listen.ts`) — зарезервированный huid широковещательного `@all`, рендерится как «all» без похода за профилем.
 - Перенос: сообщения `wrap="wrap"` (видны целиком), тред прижат к низу (оценка высоты через `estLines` по ширине панели).
 - Навигация: focus-модель `chats|thread|input`. chats: ↑/↓ чаты, → в тред, Enter писать. thread: ↑/↓ курсор сообщения (`▍`), ← назад, Enter писать. input: Enter отправить, Esc отмена.
 - Картинки: image-сообщения (`type:"image"`) показывают `🖼 file_name`; под выбранным курсором рендерится блок-арт превью из встроенного `blur_preview_file` (base64 data-URI) через `terminal-image` (`preferNativeRender:false` → Unicode-полублоки, совместимо с Ink). См. `src/tui/image.ts`, `decrypt.ts` (ImageAttachment).

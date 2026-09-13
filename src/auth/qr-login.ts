@@ -5,7 +5,7 @@ import { setAuthToken, setRtsAuthToken, setRefreshToken, setTokenExpiresAt, calc
 import { loadConfig, getBaseUrl, getEtsBaseUrl, getWebOrigin } from "../config/loader.js";
 import type { Config } from "../types/index.js";
 import { randomUUID, randomBytes } from "node:crypto";
-import qrcode from "qrcode-terminal";
+import QRCode from "qrcode";
 import nacl from "tweetnacl";
 
 interface QrRequestResponse {
@@ -639,9 +639,7 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
   const mat = buildQrMaterial(cliOverrides);
 
   console.log("Step 1/6: Scan this QR code with your eXpress app:\n");
-  qrcode.generate(mat.qrPayload, { small: true }, (qr: string) => {
-    console.log(qr);
-  });
+  console.log(await QRCode.toString(mat.qrPayload, { type: "terminal", small: true }));
   console.log(`\n  registration_id: ${mat.registrationId}`);
   console.log("  Waiting for scan (server long-polling)...\n");
   openQrInBrowser(mat.qrPayload, mat.registrationId).catch(() => {});

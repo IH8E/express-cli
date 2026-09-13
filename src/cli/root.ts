@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import packageJson from "../../package.json" with { type: "json" };
 import { createAuthCommand } from "./auth.js";
 import { createApiCommand } from "./api.js";
 import { createConfigCommand } from "./config-cmd.js";
@@ -20,7 +21,7 @@ export function createRootCommand(): Command {
   program
     .name("express-cli")
     .description("CLI client for eXpress Chat")
-    .version("0.1.6");
+    .version(packageJson.version);
 
   program.addCommand(createAuthCommand());
   program.addCommand(createApiCommand());

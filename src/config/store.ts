@@ -20,6 +20,7 @@ interface StoreSchema {
 
 const store = new Conf<StoreSchema>({
   projectName: "express-cli",
+  cwd: process.env.EXPRESS_CLI_CONFIG_DIR,
   defaults: {
     config: {},
     authToken: null,
