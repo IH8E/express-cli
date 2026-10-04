@@ -23,6 +23,7 @@ ws_listener.mjs
 # Local tooling config (machine-specific)
 .claude/settings.local.json
 CLAUDE.md
+presentation
 
 # OS
 .DS_Store

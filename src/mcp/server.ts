@@ -233,11 +233,11 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
   }, async () => {
     const material = buildQrMaterial();
 
-    const qrAscii = await QRCode.toString(material.qrPayload, { type: "terminal", small: true });
+    const qrAscii = await QRCode.toString(material.qrPayload, { type: "utf8" as "terminal", small: true });
 
     writeFileSync(join(tmpdir(), "express-qr.txt"), qrAscii, { encoding: "utf8", mode: 0o600 });
     process.stderr.write("\n" + qrAscii + "\n");
-    openQrInBrowser(material.qrPayload, material.registrationId).catch(() => {});
+    const qrPageUrl = await openQrInBrowser(material.qrPayload, material.registrationId).catch(() => null);
 
     // Persist serialisable fields so auth_qr_poll can recover after a server restart.
     const persistent = {
@@ -264,8 +264,9 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
 
     return ok(
       `${qrAscii.trim()}\n\n` +
-      `Scan with the eXpress mobile app.\n\n` +
-      `[AGENT: call auth_qr_poll immediately — do not wait for user input]`,
+      `Scan with the eXpress mobile app.\n` +
+      (qrPageUrl ? `Or open this link in a browser: ${qrPageUrl}\n` : "") +
+      `\n[AGENT: call auth_qr_poll immediately — do not wait for user input]`,
     );
   });
 

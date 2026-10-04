@@ -639,10 +639,14 @@ export async function qrLogin(cliOverrides: Partial<Config> = {}): Promise<void>
   const mat = buildQrMaterial(cliOverrides);
 
   console.log("Step 1/6: Scan this QR code with your eXpress app:\n");
-  console.log(await QRCode.toString(mat.qrPayload, { type: "terminal", small: true }));
+  console.log(await QRCode.toString(mat.qrPayload, { type: "utf8" as "terminal", small: true }));
   console.log(`\n  registration_id: ${mat.registrationId}`);
+  const qrPageUrl = await openQrInBrowser(mat.qrPayload, mat.registrationId).catch(() => null);
+  if (qrPageUrl) {
+    console.log("  Browser did not open? Paste this link into your browser:");
+    console.log(`  ${qrPageUrl}`);
+  }
   console.log("  Waiting for scan (server long-polling)...\n");
-  openQrInBrowser(mat.qrPayload, mat.registrationId).catch(() => {});
 
   const pollResult = await pollForQrScan(mat);
   await completeQrRegistration(mat, pollResult);
