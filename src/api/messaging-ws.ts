@@ -130,6 +130,7 @@ export async function sendMessageViaWebSocket(params: {
   const host = new URL(getBaseUrl(config)).hostname;
   const webOrigin = getWebOrigin(config);
   const ctsToken = getAuthToken();
+  if (!ctsToken) throw new Error("Not authenticated. Run 'express auth qr' first.");
   const ctsKey = apigwKeys.ctsKey ?? apigwKeys.encryptionKey;
   const encKeyId = ctsKey.keyId;
 
@@ -238,6 +239,7 @@ export async function sendImageViaWebSocket(params: {
   const host = new URL(getBaseUrl(config)).hostname;
   const webOrigin = getWebOrigin(config);
   const ctsToken = getAuthToken();
+  if (!ctsToken) throw new Error("Not authenticated. Run 'express auth qr' first.");
   const ctsKey = apigwKeys.ctsKey ?? apigwKeys.encryptionKey;
   const encKeyId = ctsKey.keyId;
 

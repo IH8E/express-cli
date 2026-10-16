@@ -5,7 +5,7 @@ import { loadApigwKeys, type ApigwKeys } from "../auth/keys.js";
 import { getAuthToken } from "../config/store.js";
 import { loadConfig, getBaseUrl, getWebOrigin } from "../config/index.js";
 import { refreshToken } from "../auth/token-refresh.js";
-import { decryptMessages, type HistoryMessage, type ImageAttachment } from "../api/decrypt.js";
+import { decryptMessages, type HistoryMessage, type ImageAttachment, type FileAttachment, type ReplyRef } from "../api/decrypt.js";
 import type { ExpressChat } from "../types/index.js";
 
 export interface SessionMessage {
@@ -18,6 +18,8 @@ export interface SessionMessage {
   insertedAt: string;
   type?: string;
   image?: ImageAttachment;
+  attachment?: FileAttachment;
+  reply?: ReplyRef;
 }
 
 export interface SessionActivity {
@@ -96,6 +98,18 @@ export class ExpressSession extends EventEmitter {
 
   getThreads(): ThreadSummary[] {
     return this.threads;
+  }
+
+  /** All threads of one chat. The global list (getThreads) only has threads we take part in. */
+  async listChatThreads(groupChatId: string): Promise<ThreadSummary[]> {
+    const response = await this.request("system", "thread_list", { group_chat_id: groupChatId, limit: 200, request_version: 2 });
+    return (response.thread_list ?? []) as ThreadSummary[];
+  }
+
+  /** Per-chat unread counters (system/get_unread_counters): `{counter, mention_counter}` per chat. */
+  async getUnreadCounters(): Promise<Array<{ group_chat_id: string; counter?: number; mention_counter?: number }>> {
+    const response = await this.request("system", "get_unread_counters", { group_chats: [] });
+    return (response.unread_counters ?? []) as Array<{ group_chat_id: string; counter?: number; mention_counter?: number }>;
   }
 
   /** Initial connect (awaited by the caller). Reconnection afterwards is driven
@@ -256,6 +270,8 @@ export class ExpressSession extends EventEmitter {
         insertedAt: match.inserted_at,
         type: match.type,
         image: match.image,
+        attachment: match.attachment,
+        reply: match.reply,
       };
       this.emit("message", msg);
     } catch (err) {

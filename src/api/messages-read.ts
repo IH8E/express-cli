@@ -12,7 +12,24 @@ export async function readMessages(params: {
   direction?: "backward" | "forward";
   host?: string;
 }): Promise<DecryptedMessage[]> {
-  const { chatId, limit = 20, timeoutMs = 20000, direction = "backward", host } = params;
+  const events = await readMessageEvents(params);
+  const apigwKeys = loadApigwKeys();
+  if (!apigwKeys) throw new Error("No apigw keys. Run 'express auth login' first.");
+  return decryptMessages(events, apigwKeys);
+}
+
+/** Raw events_history fetch — the caller decrypts or inspects events itself
+ * (e.g. attachment_download needs the sender_key_id to unbox the file stream key). */
+export async function readMessageEvents(params: {
+  chatId: string;
+  limit?: number;
+  timeoutMs?: number;
+  direction?: "backward" | "forward";
+  /** Page cursor: history before (backward) / after (forward) this sync_id. */
+  fromSyncId?: string;
+  host?: string;
+}): Promise<HistoryMessage[]> {
+  const { chatId, limit = 20, timeoutMs = 20000, direction = "backward", fromSyncId, host } = params;
 
   const apigwKeys = loadApigwKeys();
   if (!apigwKeys) throw new Error("No apigw keys. Run 'express auth login' first.");
@@ -21,10 +38,10 @@ export async function readMessages(params: {
   const ctsHost = new URL(getBaseUrl(config)).hostname;
   const webOrigin = getWebOrigin(config);
   const ctsToken = getAuthToken();
+  if (!ctsToken) throw new Error("Not authenticated. Run 'express auth qr' first.");
   const ctsKey = apigwKeys.ctsKey ?? apigwKeys.encryptionKey;
 
-  const history = await fetchEventsHistory(ctsHost, webOrigin, ctsToken, ctsKey.keyId, chatId, limit, timeoutMs, direction);
-  return decryptMessages(history, apigwKeys);
+  return fetchEventsHistory(ctsHost, webOrigin, ctsToken, ctsKey.keyId, chatId, limit, timeoutMs, direction, fromSyncId);
 }
 
 async function fetchEventsHistory(
@@ -36,6 +53,7 @@ async function fetchEventsHistory(
   limit: number,
   timeoutMs: number,
   direction: "backward" | "forward" = "backward",
+  fromSyncId?: string,
 ): Promise<HistoryMessage[]> {
   const wsUrl = `wss://${host}/socket/user/websocket?vsn=1.0.0&auto_join=true&key_id=${encKeyId}&version=6&background=false&voex_unencrypted=true&instance_id=${randomUUID()}`;
 
@@ -88,6 +106,7 @@ async function fetchEventsHistory(
             skip_non_affecting_rc: true,
             skip_to_sync_id_event: true,
             last_ignore_messages_at: null,
+            ...(fromSyncId ? { sync_id: fromSyncId } : {}),
           },
           ref: histRef,
         });

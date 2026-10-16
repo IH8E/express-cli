@@ -17,6 +17,11 @@ export function loadConfig(cliOverrides: Partial<Config> = {}): Config {
     ...cliOverrides,
   };
 
+  // Windows cmd's `set VAR=value && ...` appends a trailing space to the value;
+  // a stray space in the host breaks `new URL()` ("Invalid URL"). Trim defensively.
+  if (typeof merged.host === "string") merged.host = merged.host.trim();
+  if (typeof merged.token === "string") merged.token = merged.token.trim();
+
   if (!merged.token) {
     const storedToken = getAuthToken();
     if (storedToken) merged.token = storedToken;

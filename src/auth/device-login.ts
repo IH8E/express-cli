@@ -120,7 +120,7 @@ export async function deviceLogin(cliOverrides: Partial<Config> = {}): Promise<v
     console.log(`  User HUID: ${userHuid || "unknown"}`);
   }
 
-  let serverPublicKey = new Uint8Array(0);
+  let serverPublicKey: Uint8Array = new Uint8Array(0);
   let serverPublicKeyId = "";
 
   const existingKeys = loadApigwKeys();

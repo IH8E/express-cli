@@ -29,12 +29,22 @@ export async function listChatsWithNames(client: ApiClient): Promise<ExpressChat
  *  If no existing DM matches and the query looks like a person's name,
  *  searches the phonebook and auto-creates a DM. Throws on ambiguity. */
 export async function resolveChatId(client: ApiClient, chatIdOrName: string): Promise<string> {
-  if (/^[0-9a-f-]{36}$/i.test(chatIdOrName)) return chatIdOrName;
+  return (await resolveChat(client, chatIdOrName)).chatId!;
+}
+
+/** Like resolveChatId, plus the display name. With `create: false` a phonebook-only match
+ *  returns `chatId: null` instead of creating a DM (for read-only / dry-run callers). */
+export async function resolveChat(
+  client: ApiClient,
+  chatIdOrName: string,
+  opts: { create?: boolean } = {},
+): Promise<{ chatId: string | null; name?: string }> {
+  if (/^[0-9a-f-]{36}$/i.test(chatIdOrName)) return { chatId: chatIdOrName };
 
   const chats = await listChatsWithNames(client);
   const lower = chatIdOrName.toLowerCase();
   const matches = chats.filter((c) => (c.name ?? "").toLowerCase().includes(lower));
-  if (matches.length === 1) return matches[0].group_chat_id;
+  if (matches.length === 1) return { chatId: matches[0].group_chat_id, name: matches[0].name };
   if (matches.length > 1) {
     const names = matches.map((c) => `  ${c.name} (${c.group_chat_id})`).join("\n");
     throw new Error(`Multiple chats match "${chatIdOrName}":\n${names}\nUse the full chat ID.`);
@@ -49,8 +59,9 @@ export async function resolveChatId(client: ApiClient, chatIdOrName: string): Pr
   }
 
   const person = results[0];
+  if (opts.create === false) return { chatId: null, name: person.name };
   process.stderr.write(`No DM with "${person.name}" — creating one...\n`);
   const chatId = await new ChatsApi(client).createDm(person.user_huid);
   process.stderr.write(`DM created: ${chatId}\n`);
-  return chatId;
+  return { chatId, name: person.name };
 }
