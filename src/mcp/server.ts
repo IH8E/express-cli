@@ -467,9 +467,9 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
 
   server.registerTool("send_message", {
     title: "Send a message",
-    description: "Send a text message to a chat, identified by name (partial ok) or chat_id. If no DM exists with that person, one is created automatically. Returns the sync_id. With dry_run: true nothing is sent — the tool only resolves the chat and returns the exact text/recipient the real send would use (for preparing drafts a human will review).",
+    description: "Send a text message to a chat, identified by name (partial ok), chat_id, or a person's full name / email / huid (from contacts_search). To reply in an existing thread, pass its thread_id (= sync_id of the root message with thread_started: true). If no DM exists with that person, one is created automatically. Returns the sync_id. With dry_run: true nothing is sent — the tool only resolves the chat and returns the exact text/recipient the real send would use (for preparing drafts a human will review).",
     inputSchema: {
-      chat: z.string().describe("Chat name or full chat_id"),
+      chat: z.string().describe("Chat name, full chat_id, thread_id, or a person's full name / email / huid"),
       text: z.string().describe("Message text"),
       dry_run: z.boolean().optional().describe("Validate and preview the send without actually sending anything"),
     },
@@ -478,9 +478,10 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
     if (!await ensureAuth()) return notAuthenticated();
     const client = new ApiClient();
     if (dry_run) {
-      const { chatId, name } = await resolveChatNamed(client, chat);
+      const { chatId, name, userHuid } = await resolveChatNamed(client, chat);
       return ok({
         sent: false, dry_run: true, chat_id: chatId, chat: name ?? (chatId && chatNames.get(chatId)) ?? chatId?.slice(0, 8),
+        ...(userHuid ? { user_huid: userHuid } : {}),
         ...(chatId ? {} : { note: "No DM with this person yet — a real send creates one." }),
         text, characters: text.length,
       });

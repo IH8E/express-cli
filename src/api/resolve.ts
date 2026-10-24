@@ -2,7 +2,7 @@ import { ApiClient } from "./client.js";
 import { ChatsApi } from "./chats.js";
 import { UserApi } from "./user.js";
 import { PhonebookApi } from "./phonebook.js";
-import type { ExpressChat } from "../types/index.js";
+import type { ExpressChat, ExpressProfile } from "../types/index.js";
 
 /** List chats with DM display names resolved to the other participant's full name. */
 export async function listChatsWithNames(client: ApiClient): Promise<ExpressChat[]> {
@@ -38,8 +38,16 @@ export async function resolveChat(
   client: ApiClient,
   chatIdOrName: string,
   opts: { create?: boolean } = {},
-): Promise<{ chatId: string | null; name?: string }> {
-  if (/^[0-9a-f-]{36}$/i.test(chatIdOrName)) return { chatId: chatIdOrName };
+): Promise<{ chatId: string | null; name?: string; userHuid?: string }> {
+  if (/^[0-9a-f-]{36}$/i.test(chatIdOrName)) {
+    // a person's huid (e.g. from contacts_search) vs a chat/thread id: only a huid has a profile
+    const [person] = await new UserApi(client).getProfilesByHuid([chatIdOrName]);
+    if (!person) return { chatId: chatIdOrName };
+    const dm = (await new ChatsApi(client).listChats())
+      .find((c) => c.chat_type === "chat" && c.member_huids?.includes(person.user_huid));
+    if (dm) return { chatId: dm.group_chat_id, name: person.name, userHuid: person.user_huid };
+    return openDm(client, person, opts);
+  }
 
   const chats = await listChatsWithNames(client);
   const lower = chatIdOrName.toLowerCase();
@@ -51,17 +59,27 @@ export async function resolveChat(
   }
 
   // No existing chat — try phonebook and auto-create DM
-  const results = await new PhonebookApi(client).searchUsers(chatIdOrName, 5);
-  if (results.length === 0) throw new Error(`No chat or contact found matching "${chatIdOrName}"`);
-  if (results.length > 1) {
-    const names = results.map((p) => `  ${p.name} (${p.user_huid})`).join("\n");
-    throw new Error(`No existing DM with "${chatIdOrName}", found multiple contacts:\n${names}\nBe more specific.`);
-  }
+  const results = await new PhonebookApi(client).searchUsers(chatIdOrName, 20);
+  return openDm(client, pickContact(chatIdOrName, results), opts);
+}
 
-  const person = results[0];
-  if (opts.create === false) return { chatId: null, name: person.name };
+/** One phonebook hit for the query: the only result, or the one whose full name or email
+ *  equals the query (namesakes are common — WISHLIST #16). Throws otherwise. */
+export function pickContact(query: string, results: ExpressProfile[]): ExpressProfile {
+  if (results.length === 0) throw new Error(`No chat or contact found matching "${query}"`);
+  if (results.length === 1) return results[0];
+  const q = query.trim().toLowerCase();
+  const exact = results.filter((p) => p.name?.toLowerCase() === q || p.email?.toLowerCase() === q);
+  if (exact.length === 1) return exact[0];
+  const names = (exact.length ? exact : results).slice(0, 5).map((p) => `  ${p.name} ${p.email ?? ""} (${p.user_huid})`).join("\n");
+  throw new Error(`No existing DM with "${query}", found multiple contacts:\n${names}\nPass the person's huid.`);
+}
+
+async function openDm(client: ApiClient, person: ExpressProfile, opts: { create?: boolean }) {
+  const found = { name: person.name, userHuid: person.user_huid };
+  if (opts.create === false) return { chatId: null, ...found };
   process.stderr.write(`No DM with "${person.name}" — creating one...\n`);
   const chatId = await new ChatsApi(client).createDm(person.user_huid);
   process.stderr.write(`DM created: ${chatId}\n`);
-  return { chatId, name: person.name };
+  return { chatId, ...found };
 }
