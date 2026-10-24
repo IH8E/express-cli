@@ -23,7 +23,7 @@ const EXPECTED_TOOLS = [
 async function connectedClient() {
   const server = new McpServer({ name: "test", version: "0.0.0" });
   registerTools(server, {
-    session: null,
+    session: () => null,
     inbox: new Inbox(),
     chatNames: new Map(),
     senderNames: new Map(),
@@ -87,6 +87,42 @@ test("auth_qr_poll reports no pending session before auth_qr_start has run", asy
   assert.match(text, /No pending QR session/);
 });
 
+test("sessionProvider comes up once apigw keys appear and re-keys after a new login (issue #1)", async () => {
+  const { sessionProvider } = await import("./server.js");
+  const { saveApigwKeys, generateSigningKeyPair, generateEncryptionKeyPair } = await import("../auth/keys.js");
+  const { setApigwKeysRaw } = await import("../config/store.js");
+  const login = () => saveApigwKeys({
+    signingKey: generateSigningKeyPair(),
+    encryptionKey: generateEncryptionKeyPair(),
+    ctsKey: generateEncryptionKeyPair(),
+    serverPublicKey: new Uint8Array(32),
+    serverPublicKeyId: "server",
+  });
+  const prevHost = process.env.EXPRESS_HOST;
+  process.env.EXPRESS_HOST = "express.example.com"; // ExpressSession needs a configured host
+  const started: unknown[] = [];
+  const session = sessionProvider((s) => started.push(s)); // no connect — offline
+  try {
+    assert.equal(session(), null);
+    login();
+    const first = session();
+    assert.ok(first);
+    assert.equal(session(), first);
+    assert.equal(started.length, 1);
+    login();
+    const second = session();
+    assert.ok(second);
+    assert.notEqual(second, first);
+    assert.equal(started.length, 2);
+    setApigwKeysRaw(null);
+    assert.equal(session(), null);
+  } finally {
+    setApigwKeysRaw(null);
+    if (prevHost === undefined) delete process.env.EXPRESS_HOST;
+    else process.env.EXPRESS_HOST = prevHost;
+  }
+});
+
 test("Inbox buffers messages and hands out only what arrived since the last take", async () => {
   const inbox = new Inbox();
   const msg = (body: string) => ({ chatId: "c1", syncId: "s", sender: "u1", body, decrypted: true, insertedAt: new Date().toISOString() });
@@ -112,7 +148,7 @@ test("makeNormalizer produces the uniform message shape: names, own flag, local 
   void registerTools;
 
   const deps = {
-    session: null,
+    session: () => null,
     inbox: new Inbox(),
     chatNames: new Map([["chat-uuid-1", "Склянчук DM"]]),
     senderNames: new Map([
@@ -298,7 +334,7 @@ test("normalizer keeps image captions and exposes reply_to and thread_replies", 
   const self = "22222222-2222-2222-2222-222222222222";
   const other = "11111111-1111-1111-1111-111111111111";
   const { normalize } = makeNormalizer({
-    session: { getThreads: () => [{ thread_id: "root", counter: 3 }] } as never,
+    session: () => ({ getThreads: () => [{ thread_id: "root", counter: 3 }] }) as never,
     inbox: new Inbox(),
     chatNames: new Map(),
     senderNames: new Map([[self, "Я"], [other, "Коллега"]]),

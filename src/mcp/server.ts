@@ -108,7 +108,8 @@ export class Inbox {
 
 
 export interface McpToolDeps {
-  session: ExpressSession | null;
+  /** Live session, created lazily (see `sessionProvider`); null while there are no apigw keys. */
+  session: () => ExpressSession | null;
   inbox: Inbox;
   chatNames: Map<string, string>;
   senderNames: Map<string, string>;
@@ -197,7 +198,7 @@ export function makeNormalizer(deps: McpToolDeps) {
   const renderMentions = (body: string) => body.replace(MENTION_RE, (_m, huid: string) => `@${nameOf(huid)}`);
 
   /** `threads` — the chat's thread list (for reply counts); defaults to the session's global list. */
-  const normalize = async (items: NormalizeInput[], threads = session?.getThreads() ?? []): Promise<NormalizedMessage[]> => {
+  const normalize = async (items: NormalizeInput[], threads = session()?.getThreads() ?? []): Promise<NormalizedMessage[]> => {
     await ensureSelf();
     const mentioned = items.flatMap((i) => [...i.body.matchAll(MENTION_RE)].map((m) => m[1]));
     await resolveNames([...items.map((i) => i.sender), ...items.flatMap((i) => i.reply ? [i.reply.sender] : []), ...mentioned]);
@@ -315,7 +316,7 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
     // Unread counters need the live session (system/get_unread_counters over WS).
     let unread = new Map<string, { counter?: number; mention_counter?: number }>();
     try {
-      unread = new Map((await session?.getUnreadCounters())?.map((u) => [u.group_chat_id, u]) ?? []);
+      unread = new Map((await session()?.getUnreadCounters())?.map((u) => [u.group_chat_id, u]) ?? []);
     } catch (err) {
       process.stderr.write(`[mcp] unread counters unavailable: ${errorText(err)}\n`);
     }
@@ -362,14 +363,17 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
       sinceMs = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(since) ? `${since}T00:00:00` : since);
       if (Number.isNaN(sinceMs)) return ok({ error: `Invalid 'since' value: ${since}. Use ISO date-time or YYYY-MM-DD.` });
     }
-    if (unread_only && (!session || !isSessionReady())) {
-      return ok({ error: "unread_only needs the live session, which is not connected yet — retry shortly." });
+    const live = session();
+    if (unread_only && (!live || !isSessionReady())) {
+      return ok({ error: live
+        ? "unread_only needs the live session, which is not connected yet — retry shortly."
+        : "unread_only needs the live session, which is unavailable (no apigw keys).", instruction: AUTH_INSTRUCTION });
     }
 
     const client = new ApiClient();
     const chatId = await resolveExistingChat(client, chat);
     const unreadCount = unread_only
-      ? (await session!.getUnreadCounters()).find((u) => u.group_chat_id === chatId)?.counter ?? 0
+      ? (await live!.getUnreadCounters()).find((u) => u.group_chat_id === chatId)?.counter ?? 0
       : undefined;
 
     const window = limit ?? (since || since_message_id || unread_only ? 200 : 20);
@@ -385,9 +389,9 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
     if (unreadCount !== undefined) items = items.slice(Math.max(0, items.length - unreadCount));
 
     let threads: ThreadSummary[] | undefined;
-    if (session && isSessionReady() && items.some((m) => m.thread_started)) {
+    if (live && isSessionReady() && items.some((m) => m.thread_started)) {
       try {
-        threads = await session.listChatThreads(chatId);
+        threads = await live.listChatThreads(chatId);
       } catch (err) {
         process.stderr.write(`[mcp] thread_list failed, thread_replies may be missing: ${errorText(err)}\n`);
       }
@@ -519,7 +523,7 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
     inputSchema: { timeout_seconds: z.number().int().min(1).max(120).optional().describe("Max seconds to wait when nothing is pending (default 30)") },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   }, async ({ timeout_seconds }) => {
-    if (!session) return ok({ error: "Session unavailable.", instruction: AUTH_INSTRUCTION });
+    if (!session()) return ok({ error: "Session unavailable.", instruction: AUTH_INSTRUCTION });
     const items = await inbox.take((timeout_seconds ?? 30) * 1000);
     const messages = await normalize(items.map((i) => ({
       chatId: i.chatId, syncId: i.syncId, sender: i.sender, body: i.body,
@@ -658,11 +662,39 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
       await completeQrRegistration(material, pollResult, (msg) => {
         process.stderr.write(msg + "\n");
       });
+      session(); // bring up (or re-key) the live session without a restart
       return ok("Login successful. You are now authenticated.");
     } catch (err) {
       return ok(`Login failed: ${(err as Error).message}`);
     }
   });
+}
+
+/** Returns a getter for the live session that (re)creates it on demand: a process started
+ * before `auth qr` recovers once keys appear, and a re-login swaps the session to the new
+ * key (issue #1). `start` attaches listeners and connects; it runs once per created session. */
+export function sessionProvider(start: (s: ExpressSession) => void): () => ExpressSession | null {
+  let session: ExpressSession | null = null;
+  let keyId: string | undefined;
+  return () => {
+    const keys = loadApigwKeys();
+    const currentKeyId = keys ? (keys.ctsKey ?? keys.encryptionKey).keyId : undefined;
+    if (session && currentKeyId === keyId) return session;
+    session?.close();
+    session = null;
+    keyId = undefined;
+    if (!keys) return null;
+    try {
+      session = new ExpressSession();
+      keyId = currentKeyId;
+      start(session);
+    } catch (err) {
+      process.stderr.write(`[mcp] session unavailable: ${(err as Error).message}\n`);
+      session = null;
+      keyId = undefined;
+    }
+    return session;
+  };
 }
 
 /**
@@ -678,26 +710,24 @@ export async function runMcpServer(): Promise<void> {
   const chatNames = new Map<string, string>();
   const senderNames = new Map<string, string>();
   let sessionReady = false;
-  let session: ExpressSession | null = null;
-  try {
-    session = new ExpressSession();
-    session.on("connected", () => { sessionReady = true; });
-    session.on("chats", (list: ExpressChat[]) => {
+  const session = sessionProvider((s) => {
+    sessionReady = false;
+    s.on("connected", () => { sessionReady = true; });
+    s.on("chats", (list: ExpressChat[]) => {
       for (const c of list) {
         if (c.chat_type === "chat" && chatNames.has(c.group_chat_id)) continue; // raw DM name is "personal chat"
         chatNames.set(c.group_chat_id, c.name?.trim() || c.group_chat_id.slice(0, 8));
       }
     });
-    session.on("message", (m: SessionMessage) => inbox.add(m));
+    s.on("message", (m: SessionMessage) => inbox.add(m));
     // EventEmitter throws on an unhandled "error" event — without this listener a single
     // decrypt failure on an incoming push (session.ts) would crash the whole MCP process.
-    session.on("error", (err: Error) => { process.stderr.write(`[mcp] session error: ${err.message}\n`); });
-    session.connect().catch((err) => { process.stderr.write(`[mcp] session connect failed: ${(err as Error).message}\n`); });
+    s.on("error", (err: Error) => { process.stderr.write(`[mcp] session error: ${err.message}\n`); });
+    s.connect().catch((err) => { process.stderr.write(`[mcp] session connect failed: ${(err as Error).message}\n`); });
     // Resolve DM names in the background for nicer chat labels
     listChatsWithNames(new ApiClient()).then((chats) => { for (const c of chats) chatNames.set(c.group_chat_id, c.name ?? c.group_chat_id.slice(0, 8)); }).catch(() => {});
-  } catch (err) {
-    process.stderr.write(`[mcp] session unavailable: ${(err as Error).message}\n`);
-  }
+  });
+  session(); // eager start when keys are already there
 
   registerTools(server, { session, inbox, chatNames, senderNames, isSessionReady: () => sessionReady });
 
