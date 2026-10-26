@@ -27,3 +27,7 @@ test("buildTextPayload: a reply carries the quote in payload.reply, a plain mess
   assert.equal(reply.body, "ответ");
   assert.equal("reply" in JSON.parse(buildTextPayload("просто", "h1", "c1")), false);
 });
+
+test("pickRecipientKeys: no chat keys at all is an error, not a send with an empty keys[]", () => {
+  assert.throws(() => pickRecipientKeys([], []), /no keys/);
+});

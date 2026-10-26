@@ -1,5 +1,5 @@
 import WebSocket from "ws";
-import { randomBytes, randomUUID, createHash } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
 import nacl from "tweetnacl";
@@ -10,6 +10,7 @@ import { UserApi } from "./user.js";
 import { FileServiceApi, detectImageMimeType, type FileUploadKey } from "./file-service.js";
 import { encryptFileStream, FILE_CHUNK_SIZE } from "./file-crypto.js";
 import { loadApigwKeys, signEd25519 } from "../auth/keys.js";
+import { decryptWithKey, fetchKeyMap, unboxMessageKey, type HistoryMessage } from "./decrypt.js";
 import { getAuthToken } from "../config/store.js";
 import { loadConfig, getBaseUrl, getWebOrigin } from "../config/index.js";
 
@@ -61,6 +62,7 @@ function buildImagePayload(params: {
   previewHeight: number;
   blurPreviewDataUri: string;
   fileId: string;
+  reply?: ReplyQuote;
 }): string {
   return JSON.stringify({
     type: "image",
@@ -85,6 +87,7 @@ function buildImagePayload(params: {
       blur_preview_file: params.blurPreviewDataUri,
       file_id: params.fileId,
     },
+    ...(params.reply ? { reply: params.reply } : {}),
     body: params.caption,
   });
 }
@@ -114,6 +117,7 @@ interface EncryptedKey {
  * same xsalsa20 Curve25519 body (WISHLIST #17).
  */
 export function pickRecipientKeys(chatKeyIds: string[], kdcKeys: KdcKey[]): KdcKey[] {
+  if (chatKeyIds.length === 0) throw new Error("The chat lists no keys to encrypt for; the server would answer invalid_keys");
   const usable = new Map(kdcKeys.filter((k) => k.algo === "xsalsa20").map((k) => [k.id, k]));
   const missing = chatKeyIds.filter((id) => !usable.has(id));
   if (missing.length > 0) {
@@ -221,12 +225,9 @@ export async function sendMessageViaWebSocket(params: {
 
 /**
  * Generate the thumbnail eXpress expects for both the uploaded `preview` shape and the
- * inline `blur_preview_file`. These are reused as ONE buffer on purpose: our uploads sit
- * in `antimalware: scan_planned` indefinitely (server-side, not something the CLI
- * controls), and the client keeps rendering `blur_preview_file` — never `preview` —
- * for as long as that scan is pending. A separate tiny/low-quality blur placeholder
- * (meant to be shown for a fraction of a second) ends up being the only thing anyone
- * ever sees, so it needs to look like a real thumbnail, not a blur-up stub.
+ * inline `blur_preview_file` (one buffer for both). The web client shows only the blurred
+ * inline placeholder when it can't open the file — that was a wrong stream key (fixed
+ * 26.10: the file is sealed with the message key), not the antimalware scan as once assumed.
  */
 async function buildPreview(
   imageBytes: Buffer,
@@ -245,9 +246,10 @@ export async function sendImageViaWebSocket(params: {
   chatId: string;
   filePath: string;
   caption?: string;
+  reply?: ReplyQuote;
   timeoutMs?: number;
 }): Promise<{ sync_id: string }> {
-  const { client, chatId, filePath, caption = "", timeoutMs = 30000 } = params;
+  const { client, chatId, filePath, caption = "", reply, timeoutMs = 30000 } = params;
 
   const fileName = basename(filePath);
   const mimeType = detectImageMimeType(fileName);
@@ -278,17 +280,20 @@ export async function sendImageViaWebSocket(params: {
   const publicKeys = pickRecipientKeys(participantKeyIds, kdcKeys);
 
   const originalBytes = await readFile(filePath);
-  const fileHash = createHash("sha256").update(originalBytes).digest("base64");
+  // file_hash = base64(BLAKE2b-256(plaintext)), what the web client checks (see downloadAttachment)
+  const fileHash = Buffer.from(sodium.crypto_generichash(32, originalBytes, null)).toString("base64");
   const preview = await buildPreview(originalBytes);
   const blurPreviewDataUri = `data:image/jpeg;base64,${preview.blurData.toString("base64")}`;
 
-  // Step 3: the file content is encrypted under its OWN symmetric key, separate from the message envelope key.
-  const fileKey = randomBytes(32);
-  const fileKeys: FileUploadKey[] = wrapKeyForRecipients(fileKey, publicKeys, ctsKey);
+  // Step 3: the file is encrypted under the MESSAGE's own symmetric key — a payload without keys[] tells
+  // readers (web, attachment_download) that the stream key is the message key. A separate key left the
+  // web client with nothing but the blurred placeholder; only mobile (which reads the upload keys) showed it.
+  const msgKey = randomBytes(32);
+  const fileKeys: FileUploadKey[] = wrapKeyForRecipients(msgKey, publicKeys, ctsKey);
   const syncId = randomUUID();
 
-  const encryptedContent = await encryptFileStream(originalBytes, fileKey);
-  const encryptedPreview = await encryptFileStream(preview.data, fileKey);
+  const encryptedContent = await encryptFileStream(originalBytes, msgKey);
+  const encryptedPreview = await encryptFileStream(preview.data, msgKey);
 
   const uploaded = await new FileServiceApi(client).uploadWithPreview(
     {
@@ -327,10 +332,10 @@ export async function sendImageViaWebSocket(params: {
     previewHeight: preview.height,
     blurPreviewDataUri,
     fileId: uploaded.id,
+    reply,
   })));
 
-  const msgKey = randomBytes(32);
-  const encryptedKeys = wrapKeyForRecipients(msgKey, publicKeys, ctsKey);
+  const encryptedKeys = fileKeys;
 
   const msgNonce = randomBytes(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
   const ciphertext = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
@@ -380,6 +385,7 @@ async function getChatKeyIds(
     let ref = 0;
     const authRef = ref++;
     let chatInfoRef: number;
+    let threadInfoRef: number | undefined;
 
     const send = (msg: object) => ws.send(JSON.stringify(msg));
 
@@ -396,6 +402,25 @@ async function getChatKeyIds(
       if (msg.ref === authRef && msg.event === "phx_reply" && msg.payload?.status === "ok") {
         chatInfoRef = ref++;
         send({ topic: "system", event: "chat_info", payload: { group_chat_id: chatId, request_version: 6 }, ref: chatInfoRef });
+        return;
+      }
+
+      // A thread has no chat_info of its own (chat_not_found) — thread_info carries its keys.
+      if (msg.ref === chatInfoRef && msg.event === "phx_reply" && msg.payload?.status !== "ok") {
+        threadInfoRef = ref++;
+        send({ topic: "system", event: "thread_info", payload: { thread_id: chatId }, ref: threadInfoRef });
+        return;
+      }
+
+      if (msg.ref === threadInfoRef && msg.event === "phx_reply") {
+        clearTimeout(timer);
+        ws.close();
+        const keys = (msg.payload?.response?.thread_info as { keys?: string[] } | undefined)?.keys;
+        if (msg.payload?.status !== "ok" || !keys) {
+          done(() => reject(new Error(`${chatId} is neither a chat nor a thread: ${JSON.stringify(msg.payload?.response)}`)));
+          return;
+        }
+        done(() => resolve(keys));
         return;
       }
 
@@ -501,4 +526,72 @@ async function sendMessageNew(params: {
       done(() => reject(new Error("WS closed before message_new reply")));
     });
   });
+}
+
+/** One authenticated `system` request over a short-lived socket; rejects on a non-ok reply. */
+async function systemCall(event: string, payload: object, timeoutMs = 20000): Promise<Record<string, unknown>> {
+  const apigwKeys = loadApigwKeys();
+  if (!apigwKeys) throw new Error("No apigw keys. Run 'express auth login' first.");
+  const config = loadConfig();
+  const host = new URL(getBaseUrl(config)).hostname;
+  const ctsToken = getAuthToken();
+  if (!ctsToken) throw new Error("Not authenticated. Run 'express auth qr' first.");
+  const encKeyId = (apigwKeys.ctsKey ?? apigwKeys.encryptionKey).keyId;
+  const wsUrl = `wss://${host}/socket/user/websocket?vsn=1.0.0&auto_join=true&key_id=${encKeyId}&version=6&background=false&voex_unencrypted=true&instance_id=${randomUUID()}`;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn: () => void) => { if (!settled) { settled = true; clearTimeout(timer); try { ws.close(); } catch {} fn(); } };
+    const timer = setTimeout(() => done(() => reject(new Error(`Timeout waiting for ${event}`))), timeoutMs);
+    const ws = new WebSocket(wsUrl, { headers: { Origin: getWebOrigin(config), "User-Agent": "Mozilla/5.0" } });
+    ws.addEventListener("open", () => ws.send(JSON.stringify({ topic: "phoenix", event: "authenticate", payload: { token: ctsToken }, ref: 0 })));
+    ws.addEventListener("message", (e) => {
+      const msg = JSON.parse(e.data as string) as { ref: number; event: string; payload: { status: string; response: Record<string, unknown> } };
+      if (msg.ref === 0 && msg.event === "phx_reply") {
+        if (msg.payload?.status !== "ok") { done(() => reject(new Error("WS authentication failed"))); return; }
+        ws.send(JSON.stringify({ topic: "system", event, payload, ref: 1 }));
+        return;
+      }
+      if (msg.ref === 1 && msg.event === "phx_reply") {
+        if (msg.payload?.status === "ok") done(() => resolve(msg.payload.response ?? {}));
+        else done(() => reject(new Error(`${event} failed: ${JSON.stringify(msg.payload?.response)}`)));
+      }
+    });
+    ws.addEventListener("error", (err) => done(() => reject(new Error(`WS error: ${String(err)}`))));
+    ws.addEventListener("close", () => done(() => reject(new Error(`WS closed before ${event} reply`))));
+  });
+}
+
+/**
+ * Edit a message: the web client re-encrypts the WHOLE payload (body replaced) with the message's
+ * own symmetric key and sends `event_edit` — no keys[] (captured HAR, 26.10). Only own messages.
+ */
+export async function editMessageViaWebSocket(params: { client: ApiClient; event: HistoryMessage; body: string }): Promise<{ sync_id: string; edited_at?: string }> {
+  const { client, event, body } = params;
+  await sodium.ready;
+  const apigwKeys = loadApigwKeys();
+  if (!apigwKeys) throw new Error("No apigw keys. Run 'express auth login' first.");
+  const ctsKey = apigwKeys.ctsKey ?? apigwKeys.encryptionKey;
+  const symmetricKey = unboxMessageKey(event, ctsKey.privateKey, ctsKey.keyId, await fetchKeyMap([event], client), apigwKeys);
+  const plaintext = new Uint8Array(Buffer.from(JSON.stringify({ ...decryptWithKey(event, symmetricKey), body })));
+  const nonce = randomBytes(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+  const ciphertext = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
+    plaintext, payloadAad(event.group_chat_id, event.sync_id), null, new Uint8Array(nonce), symmetricKey,
+  );
+  const encryptedPayload = Buffer.concat([nonce, Buffer.from(ciphertext)]).toString("base64");
+  const signBytes = signEd25519(apigwKeys.signingKey.privateKey, new Uint8Array(Buffer.from(encryptedPayload, "utf8")));
+  const response = await systemCall("event_edit", {
+    sync_id: event.sync_id,
+    group_chat_id: event.group_chat_id,
+    payload: encryptedPayload,
+    signature: { sign: Buffer.from(signBytes).toString("base64"), sign_key_id: apigwKeys.signingKey.keyId, sign_algo: "ed25519" },
+  });
+  const edit = response.event_edit as { sync_id: string; edited_at?: string } | undefined;
+  return { sync_id: edit?.sync_id ?? event.sync_id, edited_at: edit?.edited_at };
+}
+
+/** Delete messages for everyone (`delete_events`, as the web client does). Only own messages. */
+export async function deleteMessagesViaWebSocket(params: { chatId: string; syncIds: string[] }): Promise<{ deleted: string[]; errors: unknown[] }> {
+  const response = await systemCall("delete_events", { group_chat_id: params.chatId, sync_ids: params.syncIds });
+  return { deleted: (response.delete_events as string[]) ?? [], errors: (response.errors as unknown[]) ?? [] };
 }

@@ -17,7 +17,7 @@ const { registerTools, Inbox } = await import("./server.js");const { buildQrMate
 const EXPECTED_TOOLS = [
   "chats_list", "chats_find", "messages_list", "send_message", "contacts_search",
   "contacts_self", "wait_for_messages", "status", "auth_qr_start", "auth_qr_poll",
-  "attachment_download", "thread_read",
+  "attachment_download", "thread_read", "edit_message", "delete_message",
 ];
 
 async function connectedClient() {
@@ -37,7 +37,7 @@ async function connectedClient() {
 
 after(() => { rmSync(configDir, { recursive: true, force: true }); });
 
-test("registers all 12 tools with complete annotations", async () => {
+test("registers all 14 tools with complete annotations", async () => {
   const { client } = await connectedClient();
   const { tools } = await client.listTools();
   assert.deepEqual(tools.map((t) => t.name).sort(), [...EXPECTED_TOOLS].sort());
@@ -56,6 +56,8 @@ test("read/write tools report not_authenticated without a stored token", async (
     ["chats_find", { query: "alice" }],
     ["messages_list", { chat: "alice" }],
     ["send_message", { chat: "alice", text: "hi" }],
+    ["edit_message", { chat: "alice", message_id: "x", text: "hi" }],
+    ["delete_message", { chat: "alice", message_ids: ["x"] }],
     ["contacts_search", { query: "alice" }],
     ["contacts_self", {}],
   ];
@@ -215,6 +217,7 @@ test("send_message schema exposes dry_run and stays auth-gated", async () => {
   const props = (tool.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
   assert.ok(props.dry_run, "missing 'dry_run' param");
   assert.ok(props.reply_to, "missing 'reply_to' param");
+  assert.ok(props.image_path, "missing 'image_path' param");
 
   const result = await client.callTool({ name: "send_message", arguments: { chat: "alice", text: "draft", dry_run: true } });
   const text = (result.content as Array<{ text: string }>)[0].text;

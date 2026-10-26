@@ -13,6 +13,7 @@ export interface HistoryMessage {
   inserted_at: string;
   event_type: string;
   meta?: { thread_started?: boolean; activities?: { reaction_counters?: string | null; user_reactions?: unknown } };
+  edited_at?: string | null;
 }
 
 export interface ImageAttachment {
@@ -63,6 +64,8 @@ export interface DecryptedMessage {
   /** Reactions summary from meta.activities, e.g. "✅:1;👀:1". */
   reactions?: string;
   reply?: ReplyRef;
+  /** Set when the sender edited the message (history carries the edited payload). */
+  edited_at?: string;
 }
 
 type KdcKeyMap = Map<string, { id: string; body: string; user_huid: string }>;
@@ -106,8 +109,11 @@ function decryptMessage(
   keyMap: KdcKeyMap,
   apigwKeys: ApigwKeys,
 ): DecryptedPayload {
-  const symmetricKey = unboxMessageKey(msg, ctsPrivateKey, myKeyId, keyMap, apigwKeys);
+  return decryptWithKey(msg, unboxMessageKey(msg, ctsPrivateKey, myKeyId, keyMap, apigwKeys));
+}
 
+/** Open a message payload with its already-unboxed symmetric key (an edit reuses that key). */
+export function decryptWithKey(msg: HistoryMessage, symmetricKey: Uint8Array): DecryptedPayload {
   const payloadRaw = Uint8Array.from(Buffer.from(msg.payload, "base64"));
   const msgNonce = payloadRaw.slice(0, sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
   const msgCiphertext = payloadRaw.slice(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
@@ -119,7 +125,7 @@ function decryptMessage(
 }
 
 /** Shape of the decrypted wire payload (text, image or file message). */
-interface DecryptedPayload {
+export interface DecryptedPayload {
   type?: string;
   body?: string;
   payload?: {
@@ -147,6 +153,7 @@ function toDecrypted(msg: HistoryMessage, payload: DecryptedPayload): DecryptedM
     inserted_at: msg.inserted_at,
     decrypted: true,
     type: payload.type,
+    edited_at: msg.edited_at ?? undefined,
     thread_started: msg.meta?.thread_started === true ? true : undefined,
     reactions: msg.meta?.activities?.reaction_counters ?? undefined,
   };

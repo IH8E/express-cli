@@ -8,7 +8,7 @@ import { ApiClient } from "../api/client.js";
 import { PhonebookApi } from "../api/phonebook.js";
 import { UserApi } from "../api/user.js";
 import { readMessageEvents } from "../api/messages-read.js";
-import { sendMessageViaWebSocket, type ReplyQuote } from "../api/messaging-ws.js";
+import { deleteMessagesViaWebSocket, editMessageViaWebSocket, sendImageViaWebSocket, sendMessageViaWebSocket, type ReplyQuote } from "../api/messaging-ws.js";
 import { resolveChat, listChatsWithNames } from "../api/resolve.js";
 import { downloadAttachment, unboxStreamKey } from "../api/attachments.js";
 import { decryptMessages, fetchKeyMap, getSenderPublicKey, unboxMessageKey, type DecryptedMessage, type FileAttachment, type HistoryMessage, type ReplyRef } from "../api/decrypt.js";
@@ -149,19 +149,21 @@ interface NormalizedMessage {
   /** Present when the message carries a downloadable encrypted attachment. */
   attachment?: { file_name: string; mime_type?: string; size?: number; downloadable: true };
   reply_to?: { message_id: string; sender: string; sender_huid: string; text: string };
+  /** When the sender edited it; `message` is already the edited text. */
+  edited_at?: string;
 }
 
 interface NormalizeInput {
   chatId: string; syncId: string; sender: string; body: string; decrypted: boolean;
   error?: string; insertedAt: string; image?: { fileName: string };
   attachment?: { fileName: string; mimeType?: string; fileSize?: number };
-  thread_started?: boolean; reactions?: string; reply?: ReplyRef;
+  thread_started?: boolean; reactions?: string; reply?: ReplyRef; editedAt?: string;
 }
 
 const fromDecrypted = (chatId: string, m: DecryptedMessage): NormalizeInput => ({
   chatId, syncId: m.sync_id, sender: m.sender, body: m.body, decrypted: m.decrypted,
   error: m.error, insertedAt: m.inserted_at, image: m.image, attachment: m.attachment,
-  thread_started: m.thread_started, reactions: m.reactions, reply: m.reply,
+  thread_started: m.thread_started, reactions: m.reactions, reply: m.reply, editedAt: m.edited_at,
 });
 
 /** One shape for messages_list and wait_for_messages (WISHLIST #10): names, local time,
@@ -234,6 +236,7 @@ export function makeNormalizer(deps: McpToolDeps) {
           sender_huid: i.reply.sender,
           text: renderMentions(i.reply.body).slice(0, 200),
         } : undefined,
+        edited_at: i.editedAt,
       };
     });
   };
@@ -492,9 +495,10 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
       text: z.string().describe("Message text"),
       dry_run: z.boolean().optional().describe("Validate and preview the send without actually sending anything"),
       reply_to: z.string().optional().describe("sync_id of a message in this chat to reply to (shown quoted, like a reply in the app)"),
+      image_path: z.string().optional().describe("Local image to attach (.png/.jpg/.jpeg/.gif/.webp); `text` becomes its caption"),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-  }, async ({ chat, text, dry_run, reply_to }) => withHumanErrors(async () => {
+  }, async ({ chat, text, dry_run, reply_to, image_path }) => withHumanErrors(async () => {
     if (!await ensureAuth()) return notAuthenticated();
     const client = new ApiClient();
     if (dry_run) {
@@ -510,8 +514,44 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
     if (!chatId) throw new Error(`Could not resolve chat "${chat}"`);
     const reply = reply_to ? await quoteForReply(client, chatId, reply_to) : undefined;
     if (typeof reply === "string") return ok({ error: reply });
-    const res = await sendMessageViaWebSocket({ client, chatId, body: text, reply });
+    const res = image_path
+      ? await sendImageViaWebSocket({ client, chatId, filePath: image_path, caption: text, reply })
+      : await sendMessageViaWebSocket({ client, chatId, body: text, reply });
     return ok({ sent: true, chat_id: chatId, sync_id: res.sync_id });
+  }));
+
+  server.registerTool("edit_message", {
+    title: "Edit a message",
+    description: "Replace the text of one of YOUR OWN messages (the chat shows it as edited). Pass the chat (or thread_id for a thread message) and the message's sync_id from messages_list/thread_read.",
+    inputSchema: {
+      chat: z.string().describe("Chat name, chat_id, or thread_id the message is in"),
+      message_id: z.string().describe("sync_id of your message (full, or a unique prefix of the last 1000 events)"),
+      text: z.string().describe("The new message text"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+  }, async ({ chat, message_id, text }) => withHumanErrors(async () => {
+    if (!await ensureAuth()) return notAuthenticated();
+    const client = new ApiClient();
+    const chatId = await resolveExistingChat(client, chat);
+    const event = await findMessageEvent(chatId, message_id);
+    if (typeof event === "string") return ok({ error: event });
+    const res = await editMessageViaWebSocket({ client, event, body: text });
+    return ok({ edited: true, chat_id: chatId, ...res });
+  }));
+
+  server.registerTool("delete_message", {
+    title: "Delete messages",
+    description: "Delete one or more of YOUR OWN messages for everyone (the chat shows «message deleted»). Irreversible.",
+    inputSchema: {
+      chat: z.string().describe("Chat name, chat_id, or thread_id the messages are in"),
+      message_ids: z.array(z.string()).min(1).describe("Full sync_ids of your messages"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+  }, async ({ chat, message_ids }) => withHumanErrors(async () => {
+    if (!await ensureAuth()) return notAuthenticated();
+    const chatId = await resolveExistingChat(new ApiClient(), chat);
+    const res = await deleteMessagesViaWebSocket({ chatId, syncIds: message_ids });
+    return ok({ chat_id: chatId, ...res });
   }));
 
   server.registerTool("contacts_search", {
