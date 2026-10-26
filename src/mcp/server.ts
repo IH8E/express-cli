@@ -8,7 +8,7 @@ import { ApiClient } from "../api/client.js";
 import { PhonebookApi } from "../api/phonebook.js";
 import { UserApi } from "../api/user.js";
 import { readMessageEvents } from "../api/messages-read.js";
-import { sendMessageViaWebSocket } from "../api/messaging-ws.js";
+import { sendMessageViaWebSocket, type ReplyQuote } from "../api/messaging-ws.js";
 import { resolveChat, listChatsWithNames } from "../api/resolve.js";
 import { downloadAttachment, unboxStreamKey } from "../api/attachments.js";
 import { decryptMessages, fetchKeyMap, getSenderPublicKey, unboxMessageKey, type DecryptedMessage, type FileAttachment, type HistoryMessage, type ReplyRef } from "../api/decrypt.js";
@@ -300,6 +300,21 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
     if (!r.chatId) throw new Error(`No chat with ${r.name} yet — there is nothing to read.`);
     return r.chatId;
   };
+  /** The quote a reply carries; an error string when the target can't be read. */
+  const quoteForReply = async (client: ApiClient, chatId: string, messageId: string): Promise<ReplyQuote | string> => {
+    const event = await findMessageEvent(chatId, messageId);
+    if (typeof event === "string") return event;
+    const apigwKeys = loadApigwKeys();
+    if (!apigwKeys) return "No apigw keys. Run 'express auth qr' first.";
+    const [msg] = await decryptMessages([event], apigwKeys, client);
+    if (!msg?.decrypted) return `Cannot reply to ${messageId}: it does not decrypt (${msg?.error ?? "no message"}).`;
+    const meta = (await listChatsWithNames(client)).find((c) => c.group_chat_id === chatId);
+    return {
+      sync_id: event.sync_id, group_chat_id: chatId, reply_type: meta?.chat_type ?? "group_chat",
+      source_name: meta?.name ?? "", sender_conn_type: "cts",
+      payload: { type: msg.type ?? "text", body: msg.body, from: msg.sender },
+    };
+  };
   /** messages_list/thread_read read one chat — chat/chat_id go on the envelope, not on every message (WISHLIST #14). */
   const withoutChat = (msgs: NormalizedMessage[]) => msgs.map(({ chat: _chat, chat_id: _chatId, ...m }) => m);
 
@@ -476,9 +491,10 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
       chat: z.string().describe("Chat name, full chat_id, thread_id, or a person's full name / email / huid"),
       text: z.string().describe("Message text"),
       dry_run: z.boolean().optional().describe("Validate and preview the send without actually sending anything"),
+      reply_to: z.string().optional().describe("sync_id of a message in this chat to reply to (shown quoted, like a reply in the app)"),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-  }, async ({ chat, text, dry_run }) => withHumanErrors(async () => {
+  }, async ({ chat, text, dry_run, reply_to }) => withHumanErrors(async () => {
     if (!await ensureAuth()) return notAuthenticated();
     const client = new ApiClient();
     if (dry_run) {
@@ -492,7 +508,9 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
     }
     const { chatId } = await resolveChatNamed(client, chat, true);
     if (!chatId) throw new Error(`Could not resolve chat "${chat}"`);
-    const res = await sendMessageViaWebSocket({ client, chatId, body: text });
+    const reply = reply_to ? await quoteForReply(client, chatId, reply_to) : undefined;
+    if (typeof reply === "string") return ok({ error: reply });
+    const res = await sendMessageViaWebSocket({ client, chatId, body: text, reply });
     return ok({ sent: true, chat_id: chatId, sync_id: res.sync_id });
   }));
 

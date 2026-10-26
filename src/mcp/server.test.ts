@@ -214,6 +214,7 @@ test("send_message schema exposes dry_run and stays auth-gated", async () => {
   assert.ok(tool);
   const props = (tool.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
   assert.ok(props.dry_run, "missing 'dry_run' param");
+  assert.ok(props.reply_to, "missing 'reply_to' param");
 
   const result = await client.callTool({ name: "send_message", arguments: { chat: "alice", text: "draft", dry_run: true } });
   const text = (result.content as Array<{ text: string }>)[0].text;

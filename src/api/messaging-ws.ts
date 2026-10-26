@@ -20,7 +20,17 @@ import { loadConfig, getBaseUrl, getWebOrigin } from "../config/index.js";
  * `body` on receipt, so no bodyAstTree on the wire. A bare `{body}` makes
  * recipients show "Can't decrypt".
  */
-function buildTextPayload(text: string, fromHuid: string, chatId: string): string {
+/** The quoted message a reply carries in payload.reply (shape copied from a web-client reply). */
+export interface ReplyQuote {
+  sync_id: string;
+  group_chat_id: string;
+  reply_type: string; // the chat's chat_type, e.g. "group_chat"
+  source_name: string;
+  sender_conn_type: "cts";
+  payload: { type: string; body: string; from: string };
+}
+
+export function buildTextPayload(text: string, fromHuid: string, chatId: string, reply?: ReplyQuote): string {
   return JSON.stringify({
     type: "text",
     msg_id: randomUUID(),
@@ -31,6 +41,7 @@ function buildTextPayload(text: string, fromHuid: string, chatId: string): strin
     lng: 0,
     link_meta_disabled: false,
     stealth_forwarding: false,
+    ...(reply ? { reply } : {}),
     body: text,
   });
 }
@@ -83,7 +94,7 @@ function payloadAad(chatId: string, syncId: string): Uint8Array {
   return new Uint8Array(Buffer.from(`${chatId}:${syncId}`));
 }
 
-interface KdcKey {
+export interface KdcKey {
   id: string;
   body: string; // base64 Curve25519 public key
   algo: string;
@@ -95,6 +106,21 @@ interface EncryptedKey {
   key_id: string;
   key: string; // base64 nonce+ciphertext
   algo: string;
+}
+
+/**
+ * The chat's own key_ids decide the recipients: the server rejects message_new with `invalid_keys`
+ * unless keys[] covers every one of them. Not only `cts` — a group can carry a `rest` (server) key,
+ * same xsalsa20 Curve25519 body (WISHLIST #17).
+ */
+export function pickRecipientKeys(chatKeyIds: string[], kdcKeys: KdcKey[]): KdcKey[] {
+  const usable = new Map(kdcKeys.filter((k) => k.algo === "xsalsa20").map((k) => [k.id, k]));
+  const missing = chatKeyIds.filter((id) => !usable.has(id));
+  if (missing.length > 0) {
+    const kinds = missing.map((id) => kdcKeys.find((k) => k.id === id)?.kind ?? "not returned by KDC");
+    throw new Error(`Cannot encrypt for ${missing.length} of ${chatKeyIds.length} chat keys (${kinds.join(", ")}); the server would answer invalid_keys`);
+  }
+  return chatKeyIds.map((id) => usable.get(id)!);
 }
 
 /** Seal a symmetric key for each recipient via nacl.box (Curve25519 + XSalsa20-Poly1305). */
@@ -117,9 +143,10 @@ export async function sendMessageViaWebSocket(params: {
   client: ApiClient;
   chatId: string;
   body: string;
+  reply?: ReplyQuote;
   timeoutMs?: number;
 }): Promise<{ sync_id: string }> {
-  const { client, chatId, body, timeoutMs = 20000 } = params;
+  const { client, chatId, body, reply, timeoutMs = 20000 } = params;
 
   await sodium.ready;
 
@@ -139,11 +166,11 @@ export async function sendMessageViaWebSocket(params: {
   // set exactly — no extra/superseded key_ids allowed, so encrypt for these only.
   const participantKeyIds = await getChatKeyIds(host, webOrigin, ctsToken, encKeyId, chatId);
 
-  // Step 2: fetch public keys from KDC (only cts keys are usable for E2E)
+  // Step 2: fetch the chat keys' public bodies from KDC
   const kdcKeys = await client.get<KdcKey[]>(
     `/api/v1/kdc/keys/?ids=${participantKeyIds.join(",")}`,
   ) ?? [];
-  const publicKeys = kdcKeys.filter((k) => k.kind === "cts");
+  const publicKeys = pickRecipientKeys(participantKeyIds, kdcKeys);
 
   // Step 3: generate symmetric key + sync_id (sync_id is part of the body AAD)
   const symmetricKey = randomBytes(32);
@@ -156,7 +183,7 @@ export async function sendMessageViaWebSocket(params: {
   // AAD = `${group_chat_id}:${sync_id}` — recipients authenticate against it, so
   // it must match or they get "Can't decrypt".
   const selfHuid = (await new UserApi(client).getSelfProfile()).user_huid;
-  const plaintext = new Uint8Array(Buffer.from(buildTextPayload(body, selfHuid, chatId)));
+  const plaintext = new Uint8Array(Buffer.from(buildTextPayload(body, selfHuid, chatId, reply)));
   const msgNonce = randomBytes(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
   const ciphertext = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
     plaintext, payloadAad(chatId, syncId), null,
@@ -248,7 +275,7 @@ export async function sendImageViaWebSocket(params: {
   const kdcKeys = await client.get<KdcKey[]>(
     `/api/v1/kdc/keys/?ids=${participantKeyIds.join(",")}`,
   ) ?? [];
-  const publicKeys = kdcKeys.filter((k) => k.kind === "cts");
+  const publicKeys = pickRecipientKeys(participantKeyIds, kdcKeys);
 
   const originalBytes = await readFile(filePath);
   const fileHash = createHash("sha256").update(originalBytes).digest("base64");
