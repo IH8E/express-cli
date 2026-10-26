@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { sendMessageViaWebSocket, sendImageViaWebSocket } from "../api/messaging-ws.js";
+import { sendMessageViaWebSocket, sendFileViaWebSocket } from "../api/messaging-ws.js";
 import { ApiClient } from "../api/client.js";
 import { resolveChatId } from "../api/resolve.js";
 import { formatOutput, type OutputFormat } from "./output.js";
@@ -29,7 +29,7 @@ export function createSendCommand(): Command {
 
   cmd
     .command("file <chat-id-or-name> <file-path>")
-    .description("Send a file to a chat (chat ID or partial name). Currently images only: .png, .jpg, .jpeg, .gif, .webp")
+    .description("Send a file to a chat (chat ID or partial name). Images (.png, .jpg, .jpeg, .gif, .webp) go with a preview, anything else as a document")
     .option("--caption <caption>", "File caption")
     .option("--host <host>", "eXpress host")
     .option("-o, --output <format>", "Output format", "json")
@@ -37,7 +37,7 @@ export function createSendCommand(): Command {
       try {
         const client = new ApiClient(opts.host ? { host: opts.host } : undefined);
         const chatId = await resolveChatId(client, chatIdOrName);
-        const result = await sendImageViaWebSocket({ client, chatId, filePath, caption: opts.caption });
+        const result = await sendFileViaWebSocket({ client, chatId, filePath, caption: opts.caption });
         console.log(formatOutput(result, opts.output));
       } catch (err) {
         console.error(`Error: ${(err as Error).message}`);

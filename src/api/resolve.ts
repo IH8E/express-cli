@@ -83,3 +83,13 @@ async function openDm(client: ApiClient, person: ExpressProfile, opts: { create?
   process.stderr.write(`DM created: ${chatId}\n`);
   return { chatId, ...found };
 }
+
+/** One person by huid, full name or email (same namesake rules as a DM recipient). */
+export async function resolvePerson(client: ApiClient, query: string): Promise<ExpressProfile> {
+  if (/^[0-9a-f-]{36}$/i.test(query)) {
+    const [person] = await new UserApi(client).getProfilesByHuid([query]);
+    if (!person) throw new Error(`No person with huid ${query}`);
+    return person;
+  }
+  return pickContact(query, await new PhonebookApi(client).searchUsers(query, 20));
+}

@@ -7,10 +7,11 @@ import sodium from "libsodium-wrappers-sumo";
 import sharp from "sharp";
 import type { ApiClient } from "./client.js";
 import { UserApi } from "./user.js";
-import { FileServiceApi, detectImageMimeType, type FileUploadKey } from "./file-service.js";
+import { FileServiceApi, detectDocumentMimeType, detectImageMimeType, type FileUploadKey } from "./file-service.js";
 import { encryptFileStream, FILE_CHUNK_SIZE } from "./file-crypto.js";
 import { loadApigwKeys, signEd25519 } from "../auth/keys.js";
 import { decryptWithKey, fetchKeyMap, unboxMessageKey, type HistoryMessage } from "./decrypt.js";
+import type { WireMention } from "./mentions.js";
 import { getAuthToken } from "../config/store.js";
 import { loadConfig, getBaseUrl, getWebOrigin } from "../config/index.js";
 
@@ -31,7 +32,7 @@ export interface ReplyQuote {
   payload: { type: string; body: string; from: string };
 }
 
-export function buildTextPayload(text: string, fromHuid: string, chatId: string, reply?: ReplyQuote): string {
+export function buildTextPayload(text: string, fromHuid: string, chatId: string, reply?: ReplyQuote, mentions?: WireMention[]): string {
   return JSON.stringify({
     type: "text",
     msg_id: randomUUID(),
@@ -43,6 +44,7 @@ export function buildTextPayload(text: string, fromHuid: string, chatId: string,
     link_meta_disabled: false,
     stealth_forwarding: false,
     ...(reply ? { reply } : {}),
+    ...(mentions?.length ? { mentions } : {}),
     body: text,
   });
 }
@@ -85,6 +87,35 @@ function buildImagePayload(params: {
       file_preview_width: params.previewWidth,
       file_preview_height: params.previewHeight,
       blur_preview_file: params.blurPreviewDataUri,
+      file_id: params.fileId,
+    },
+    ...(params.reply ? { reply: params.reply } : {}),
+    body: params.caption,
+  });
+}
+
+/** Wire plaintext for a non-image file (`document`, shape from a web-client send). */
+function buildDocumentPayload(params: {
+  fromHuid: string; chatId: string; caption: string; fileName: string; fileSize: number;
+  fileHash: string; mimeType: string; contentPath: string; fileId: string; reply?: ReplyQuote;
+}): string {
+  return JSON.stringify({
+    type: "document",
+    msg_id: randomUUID(),
+    from: params.fromHuid,
+    timestamp: new Date().toISOString(),
+    group_chat_id: params.chatId,
+    lat: 0,
+    lng: 0,
+    stealth_forwarding: false,
+    payload: {
+      file: params.contentPath,
+      file_name: params.fileName,
+      file_size: params.fileSize,
+      file_hash: params.fileHash,
+      file_mime_type: params.mimeType,
+      chunk_size: FILE_CHUNK_SIZE,
+      file_encryption_algo: "stream",
       file_id: params.fileId,
     },
     ...(params.reply ? { reply: params.reply } : {}),
@@ -148,9 +179,10 @@ export async function sendMessageViaWebSocket(params: {
   chatId: string;
   body: string;
   reply?: ReplyQuote;
+  mentions?: WireMention[];
   timeoutMs?: number;
 }): Promise<{ sync_id: string }> {
-  const { client, chatId, body, reply, timeoutMs = 20000 } = params;
+  const { client, chatId, body, reply, mentions, timeoutMs = 20000 } = params;
 
   await sodium.ready;
 
@@ -187,7 +219,7 @@ export async function sendMessageViaWebSocket(params: {
   // AAD = `${group_chat_id}:${sync_id}` — recipients authenticate against it, so
   // it must match or they get "Can't decrypt".
   const selfHuid = (await new UserApi(client).getSelfProfile()).user_huid;
-  const plaintext = new Uint8Array(Buffer.from(buildTextPayload(body, selfHuid, chatId, reply)));
+  const plaintext = new Uint8Array(Buffer.from(buildTextPayload(body, selfHuid, chatId, reply, mentions)));
   const msgNonce = randomBytes(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
   const ciphertext = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
     plaintext, payloadAad(chatId, syncId), null,
@@ -241,7 +273,7 @@ async function buildPreview(
   return { data, width: width ?? 0, height: height ?? 0, blurData };
 }
 
-export async function sendImageViaWebSocket(params: {
+export async function sendFileViaWebSocket(params: {
   client: ApiClient;
   chatId: string;
   filePath: string;
@@ -252,12 +284,8 @@ export async function sendImageViaWebSocket(params: {
   const { client, chatId, filePath, caption = "", reply, timeoutMs = 30000 } = params;
 
   const fileName = basename(filePath);
-  const mimeType = detectImageMimeType(fileName);
-  if (!mimeType) {
-    throw new Error(
-      `Unsupported file type for '${fileName}'. Only images are currently supported: .png, .jpg, .jpeg, .gif, .webp`,
-    );
-  }
+  const imageMime = detectImageMimeType(fileName);
+  const mimeType = imageMime ?? detectDocumentMimeType(fileName);
 
   await sodium.ready;
 
@@ -282,8 +310,8 @@ export async function sendImageViaWebSocket(params: {
   const originalBytes = await readFile(filePath);
   // file_hash = base64(BLAKE2b-256(plaintext)), what the web client checks (see downloadAttachment)
   const fileHash = Buffer.from(sodium.crypto_generichash(32, originalBytes, null)).toString("base64");
-  const preview = await buildPreview(originalBytes);
-  const blurPreviewDataUri = `data:image/jpeg;base64,${preview.blurData.toString("base64")}`;
+  // images go as `image` with a preview; anything else as `document`, content only (web client, HAR 26.10)
+  const preview = imageMime ? await buildPreview(originalBytes) : undefined;
 
   // Step 3: the file is encrypted under the MESSAGE's own symmetric key — a payload without keys[] tells
   // readers (web, attachment_download) that the stream key is the message key. A separate key left the
@@ -293,9 +321,8 @@ export async function sendImageViaWebSocket(params: {
   const syncId = randomUUID();
 
   const encryptedContent = await encryptFileStream(originalBytes, msgKey);
-  const encryptedPreview = await encryptFileStream(preview.data, msgKey);
 
-  const uploaded = await new FileServiceApi(client).uploadWithPreview(
+  const uploaded = await new FileServiceApi(client).upload(
     {
       subject: "groupchat_file",
       subject_id: chatId,
@@ -304,7 +331,7 @@ export async function sendImageViaWebSocket(params: {
       mime_type: mimeType,
       meta: {
         sync_id: syncId,
-        kind: "media",
+        kind: preview ? "media" : "document",
         chunk_size: FILE_CHUNK_SIZE,
         file_encryption_algo: "stream",
         sender_key_id: encKeyId,
@@ -313,27 +340,21 @@ export async function sendImageViaWebSocket(params: {
       },
     },
     encryptedContent,
-    { data: encryptedPreview, mimeType: "image/jpeg" },
+    preview ? { data: await encryptFileStream(preview.data, msgKey), mimeType: "image/jpeg" } : undefined,
   );
 
   // Step 4: build + encrypt the chat message that references the uploaded file (mirrors sendMessageViaWebSocket).
   const selfHuid = (await new UserApi(client).getSelfProfile()).user_huid;
-  const plaintext = new Uint8Array(Buffer.from(buildImagePayload({
-    fromHuid: selfHuid,
-    chatId,
-    caption,
-    fileName,
-    fileSize: originalBytes.length,
-    fileHash,
-    mimeType,
-    contentPath: uploaded.content,
-    previewPath: uploaded.content_shapes.preview ?? "",
-    previewWidth: preview.width,
-    previewHeight: preview.height,
-    blurPreviewDataUri,
-    fileId: uploaded.id,
-    reply,
-  })));
+  const file = { fromHuid: selfHuid, chatId, caption, fileName, fileSize: originalBytes.length, fileHash, mimeType, contentPath: uploaded.content, fileId: uploaded.id, reply };
+  const plaintext = new Uint8Array(Buffer.from(preview
+    ? buildImagePayload({
+      ...file,
+      previewPath: uploaded.content_shapes.preview ?? "",
+      previewWidth: preview.width,
+      previewHeight: preview.height,
+      blurPreviewDataUri: `data:image/jpeg;base64,${preview.blurData.toString("base64")}`,
+    })
+    : buildDocumentPayload(file)));
 
   const encryptedKeys = fileKeys;
 
@@ -528,8 +549,8 @@ async function sendMessageNew(params: {
   });
 }
 
-/** One authenticated `system` request over a short-lived socket; rejects on a non-ok reply. */
-async function systemCall(event: string, payload: object, timeoutMs = 20000): Promise<Record<string, unknown>> {
+/** One authenticated request (`system` topic by default) over a short-lived socket; rejects on a non-ok reply. */
+async function systemCall(event: string, payload: object, topic = "system", timeoutMs = 20000): Promise<Record<string, unknown>> {
   const apigwKeys = loadApigwKeys();
   if (!apigwKeys) throw new Error("No apigw keys. Run 'express auth login' first.");
   const config = loadConfig();
@@ -549,7 +570,7 @@ async function systemCall(event: string, payload: object, timeoutMs = 20000): Pr
       const msg = JSON.parse(e.data as string) as { ref: number; event: string; payload: { status: string; response: Record<string, unknown> } };
       if (msg.ref === 0 && msg.event === "phx_reply") {
         if (msg.payload?.status !== "ok") { done(() => reject(new Error("WS authentication failed"))); return; }
-        ws.send(JSON.stringify({ topic: "system", event, payload, ref: 1 }));
+        ws.send(JSON.stringify({ topic, event, payload, ref: 1 }));
         return;
       }
       if (msg.ref === 1 && msg.event === "phx_reply") {
@@ -594,4 +615,11 @@ export async function editMessageViaWebSocket(params: { client: ApiClient; event
 export async function deleteMessagesViaWebSocket(params: { chatId: string; syncIds: string[] }): Promise<{ deleted: string[]; errors: unknown[] }> {
   const response = await systemCall("delete_events", { group_chat_id: params.chatId, sync_ids: params.syncIds });
   return { deleted: (response.delete_events as string[]) ?? [], errors: (response.errors as unknown[]) ?? [] };
+}
+
+/** Put or take back a reaction (`groupchat:<chat>` add_reaction / remove_reaction, as the web client does). */
+export async function reactViaWebSocket(params: { event: HistoryMessage; reaction: string; remove?: boolean }): Promise<void> {
+  const { event, reaction, remove } = params;
+  await systemCall(remove ? "remove_reaction" : "add_reaction",
+    { reaction, event_sync_id: event.sync_id, event_sender: event.sender }, `groupchat:${event.group_chat_id}`);
 }

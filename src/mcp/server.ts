@@ -1,15 +1,15 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { writeFileSync, readFileSync, unlinkSync } from "node:fs";
+import { writeFileSync, readFileSync, unlinkSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { ApiClient } from "../api/client.js";
 import { PhonebookApi } from "../api/phonebook.js";
 import { UserApi } from "../api/user.js";
 import { readMessageEvents } from "../api/messages-read.js";
-import { deleteMessagesViaWebSocket, editMessageViaWebSocket, sendImageViaWebSocket, sendMessageViaWebSocket, type ReplyQuote } from "../api/messaging-ws.js";
-import { resolveChat, listChatsWithNames } from "../api/resolve.js";
+import { deleteMessagesViaWebSocket, editMessageViaWebSocket, reactViaWebSocket, sendFileViaWebSocket, sendMessageViaWebSocket, type ReplyQuote } from "../api/messaging-ws.js";
+import { resolveChat, resolvePerson, listChatsWithNames } from "../api/resolve.js";
 import { downloadAttachment, unboxStreamKey } from "../api/attachments.js";
 import { decryptMessages, fetchKeyMap, getSenderPublicKey, unboxMessageKey, type DecryptedMessage, type FileAttachment, type HistoryMessage, type ReplyRef } from "../api/decrypt.js";
 import { loadApigwKeys } from "../auth/keys.js";
@@ -18,7 +18,7 @@ import { refreshToken } from "../auth/token-refresh.js";
 import { buildQrMaterial, pollForQrScan, completeQrRegistration } from "../auth/qr-login.js";
 import { openQrInBrowser } from "../auth/qr-browser.js";
 import { ExpressSession, type SessionMessage, type ThreadSummary } from "../session/session.js";
-import { MENTION_RE, ALL_MENTION_HUID } from "../api/mentions.js";
+import { MENTION_RE, ALL_MENTION_HUID, applyMentions, type MentionTarget } from "../api/mentions.js";
 import type { ExpressChat } from "../types/index.js";
 import QRCode from "qrcode";
 import packageJson from "../../package.json" with { type: "json" };
@@ -489,35 +489,70 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
 
   server.registerTool("send_message", {
     title: "Send a message",
-    description: "Send a text message to a chat, identified by name (partial ok), chat_id, or a person's full name / email / huid (from contacts_search). To reply in an existing thread, pass its thread_id (= sync_id of the root message with thread_started: true). If no DM exists with that person, one is created automatically. Returns the sync_id. With dry_run: true nothing is sent — the tool only resolves the chat and returns the exact text/recipient the real send would use (for preparing drafts a human will review).",
+    description: "Send a text message to a chat, identified by name (partial ok), chat_id, or a person's full name / email / huid (from contacts_search). To reply in an existing thread, pass its thread_id (= sync_id of the root message with thread_started: true). Optional: reply_to (quote a message), mentions (@person or @all, with a notification), file_path (attach any file; images get a preview, `text` becomes the caption). If no DM exists with that person, one is created automatically. Returns the sync_id. With dry_run: true nothing is sent — it returns the resolved chat, the final text, who gets mentioned, the quoted message and the file, for a human to check first.",
     inputSchema: {
       chat: z.string().describe("Chat name, full chat_id, thread_id, or a person's full name / email / huid"),
-      text: z.string().describe("Message text"),
+      text: z.string().describe("Message text; {0}, {1}… place the n-th mention, otherwise mentions go first"),
       dry_run: z.boolean().optional().describe("Validate and preview the send without actually sending anything"),
       reply_to: z.string().optional().describe("sync_id of a message in this chat to reply to (shown quoted, like a reply in the app)"),
-      image_path: z.string().optional().describe("Local image to attach (.png/.jpg/.jpeg/.gif/.webp); `text` becomes its caption"),
+      mentions: z.array(z.string()).optional().describe("People to @mention: full name, email or huid; \"all\" for everyone in the chat"),
+      file_path: z.string().optional().describe("Local file to attach (any type; .png/.jpg/.jpeg/.gif/.webp go as images); `text` becomes its caption"),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-  }, async ({ chat, text, dry_run, reply_to, image_path }) => withHumanErrors(async () => {
+  }, async ({ chat, text, dry_run, reply_to, mentions, file_path }) => withHumanErrors(async () => {
     if (!await ensureAuth()) return notAuthenticated();
+    if (mentions?.length && file_path) return ok({ error: "mentions with file_path is not supported yet — send the mention as a separate text message." });
     const client = new ApiClient();
+    const targets: MentionTarget[] = [];
+    for (const m of mentions ?? []) {
+      if (m.trim().toLowerCase() === "all") targets.push({ all: true });
+      else { const p = await resolvePerson(client, m); targets.push({ user_huid: p.user_huid, name: p.name }); }
+    }
+    const withMentions = targets.length ? applyMentions(text, targets) : undefined;
+    const body = withMentions?.body ?? text;
+    const file = file_path ? { file_name: basename(file_path), size: statSync(file_path).size } : undefined;
     if (dry_run) {
       const { chatId, name, userHuid } = await resolveChatNamed(client, chat);
+      const quote = reply_to && chatId ? await quoteForReply(client, chatId, reply_to) : undefined;
+      if (typeof quote === "string") return ok({ error: quote });
+      const shown = targets.reduce((t, m, i) => t.split(`@{mention:${withMentions!.mentions[i].mention_id}}`).join(`@${m.all ? "all" : m.name}`), body);
       return ok({
         sent: false, dry_run: true, chat_id: chatId, chat: name ?? (chatId && chatNames.get(chatId)) ?? chatId?.slice(0, 8),
         ...(userHuid ? { user_huid: userHuid } : {}),
         ...(chatId ? {} : { note: "No DM with this person yet — a real send creates one." }),
-        text, characters: text.length,
+        text: shown, characters: shown.length,
+        ...(targets.length ? { mentions: targets.map((m) => (m.all ? { all: true } : { name: m.name, user_huid: m.user_huid })) } : {}),
+        ...(quote ? { reply_to: { message_id: quote.sync_id, sender: deps.senderNames.get(quote.payload.from) ?? quote.payload.from.slice(0, 8), text: quote.payload.body.slice(0, 200) } } : {}),
+        ...(file ? { file } : {}),
       });
     }
     const { chatId } = await resolveChatNamed(client, chat, true);
     if (!chatId) throw new Error(`Could not resolve chat "${chat}"`);
     const reply = reply_to ? await quoteForReply(client, chatId, reply_to) : undefined;
     if (typeof reply === "string") return ok({ error: reply });
-    const res = image_path
-      ? await sendImageViaWebSocket({ client, chatId, filePath: image_path, caption: text, reply })
-      : await sendMessageViaWebSocket({ client, chatId, body: text, reply });
+    const res = file_path
+      ? await sendFileViaWebSocket({ client, chatId, filePath: file_path, caption: text, reply })
+      : await sendMessageViaWebSocket({ client, chatId, body, reply, mentions: withMentions?.mentions });
     return ok({ sent: true, chat_id: chatId, sync_id: res.sync_id });
+  }));
+
+  server.registerTool("react", {
+    title: "React to a message",
+    description: "Put an emoji reaction on a message (e.g. ✅ for «taken»), or take your reaction back with remove: true.",
+    inputSchema: {
+      chat: z.string().describe("Chat name, chat_id, or thread_id the message is in"),
+      message_id: z.string().describe("sync_id of the message (full, or a unique prefix of the last 1000 events)"),
+      emoji: z.string().describe("The reaction emoji, e.g. ✅"),
+      remove: z.boolean().optional().describe("Take back your reaction instead of adding it"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async ({ chat, message_id, emoji, remove }) => withHumanErrors(async () => {
+    if (!await ensureAuth()) return notAuthenticated();
+    const chatId = await resolveExistingChat(new ApiClient(), chat);
+    const event = await findMessageEvent(chatId, message_id);
+    if (typeof event === "string") return ok({ error: event });
+    await reactViaWebSocket({ event, reaction: emoji, remove });
+    return ok({ chat_id: chatId, sync_id: event.sync_id, reaction: emoji, removed: !!remove });
   }));
 
   server.registerTool("edit_message", {

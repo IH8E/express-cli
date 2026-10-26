@@ -2,6 +2,7 @@ import nacl from "tweetnacl";
 import sodium from "libsodium-wrappers-sumo";
 import { loadApigwKeys } from "../auth/keys.js";
 import { ApiClient } from "./client.js";
+import { mentionTokensToHuids, type WireMention } from "./mentions.js";
 
 export interface HistoryMessage {
   sync_id: string;
@@ -143,6 +144,7 @@ export interface DecryptedPayload {
     keys?: Array<{ key_id: string; key: string; algo: string }>;
   };
   reply?: { sync_id?: string; payload?: { from?: string; body?: string } };
+  mentions?: WireMention[];
 }
 
 function toDecrypted(msg: HistoryMessage, payload: DecryptedPayload): DecryptedMessage {
@@ -179,7 +181,7 @@ function toDecrypted(msg: HistoryMessage, payload: DecryptedPayload): DecryptedM
   const reply: ReplyRef | undefined = r?.sync_id
     ? { sync_id: r.sync_id, sender: r.payload?.from ?? "", body: r.payload?.body ?? "" }
     : undefined;
-  return { ...base, body: payload.body ?? "", image, attachment, reply };
+  return { ...base, body: mentionTokensToHuids(payload.body ?? "", payload.mentions), image, attachment, reply };
 }
 
 export function getSenderPublicKey(

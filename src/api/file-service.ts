@@ -17,7 +17,7 @@ export interface ResumableUploadInit {
   mime_type: string;
   meta: {
     sync_id: string;
-    kind: "media";
+    kind: "media" | "document";
     chunk_size: number;
     file_encryption_algo: "stream";
     sender_key_id: string;
@@ -44,6 +44,28 @@ const IMAGE_MIME_TYPES: Record<string, string> = {
   ".webp": "image/webp",
 };
 
+const DOCUMENT_MIME_TYPES: Record<string, string> = {
+  ".txt": "text/plain",
+  ".log": "text/plain",
+  ".md": "text/markdown",
+  ".csv": "text/csv",
+  ".json": "application/json",
+  ".ndjson": "application/x-ndjson",
+  ".yaml": "application/yaml",
+  ".yml": "application/yaml",
+  ".xml": "application/xml",
+  ".pdf": "application/pdf",
+  ".zip": "application/zip",
+  ".gz": "application/gzip",
+  ".tar": "application/x-tar",
+};
+
+/** Any non-image file goes as a document; unknown extensions as octet-stream. */
+export function detectDocumentMimeType(fileName: string): string {
+  const ext = fileName.includes(".") ? "." + fileName.split(".").pop()!.toLowerCase() : "";
+  return DOCUMENT_MIME_TYPES[ext] ?? "application/octet-stream";
+}
+
 export function detectImageMimeType(fileName: string): string | null {
   const ext = fileName.includes(".") ? "." + fileName.split(".").pop()!.toLowerCase() : "";
   return IMAGE_MIME_TYPES[ext] ?? null;
@@ -52,18 +74,18 @@ export function detectImageMimeType(fileName: string): string | null {
 export class FileServiceApi {
   constructor(private client: ApiClient) {}
 
-  /** Uploads an already-encrypted content blob plus an already-encrypted JPEG preview via the resumable protocol. */
-  async uploadWithPreview(
+  /** Uploads an already-encrypted content blob (plus an already-encrypted JPEG preview for images) via the resumable protocol. */
+  async upload(
     init: ResumableUploadInit,
     content: Buffer,
-    preview: { data: Buffer; mimeType: string },
+    preview?: { data: Buffer; mimeType: string },
   ): Promise<UploadedFile> {
     const resumableId = await this.initUpload(
       init,
-      `content=${content.length};preview=${preview.data.length},${preview.mimeType}`,
+      preview ? `content=${content.length};preview=${preview.data.length},${preview.mimeType}` : `content=${content.length}`,
     );
-    await this.uploadPart(resumableId, "content", content);
-    const finalRes = await this.uploadPart(resumableId, "preview", preview.data);
+    const contentRes = await this.uploadPart(resumableId, "content", content);
+    const finalRes = preview ? await this.uploadPart(resumableId, "preview", preview.data) : contentRes;
     const body = (await finalRes.json()) as { status: string; result: UploadedFile };
     return body.result;
   }
