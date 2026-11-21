@@ -47,10 +47,17 @@ function getDomain(ctsHost: string): string {
   return parts.length > 2 ? parts.slice(1).join('.') : ctsHost;
 }
 
+/** `ets_host` may be a full URL or a bare host; both are accepted. */
+function withScheme(value: string): string {
+  return /^https?:\/\//.test(value) ? value.replace(/\/$/, "") : `https://${value}`;
+}
+
 export function getEtsBaseUrl(config: Config): string {
+  if (config.ets_host) return withScheme(config.ets_host);
   return `https://ets.${getDomain(config.host)}`;
 }
 
 export function getWebOrigin(config: Config): string {
+  if (config.web_origin) return withScheme(config.web_origin);
   return `https://${getDomain(config.host)}`;
 }

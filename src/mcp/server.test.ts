@@ -368,3 +368,25 @@ test("buildQrMaterial produces self-consistent local crypto material", () => {
   assert.equal(payload.registration_id, material.registrationId);
   assert.equal(material.encryptionKey.length, 32);
 });
+
+test("withTopicRetry retries a fresh-DM 'unmatched topic' and then succeeds", async () => {
+  const { withTopicRetry } = await import("./server.js");
+  let calls = 0;
+  const result = await withTopicRetry(async () => {
+    calls++;
+    if (calls < 3) throw new Error('message_new failed: {"reason":"unmatched topic"}');
+    return "sent";
+  });
+  assert.equal(result, "sent");
+  assert.equal(calls, 3);
+});
+
+test("withTopicRetry does not retry unrelated send errors", async () => {
+  const { withTopicRetry } = await import("./server.js");
+  let calls = 0;
+  await assert.rejects(
+    () => withTopicRetry(async () => { calls++; throw new Error('message_new failed: {"error":"invalid_keys"}'); }),
+    /invalid_keys/,
+  );
+  assert.equal(calls, 1, "a key error must surface immediately, not after retries");
+});

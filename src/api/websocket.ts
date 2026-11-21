@@ -19,11 +19,19 @@ interface PhxReply {
   };
 }
 
+/** Legacy derivation kept as a fallback; callers normally pass the configured origin. */
+function resolveWebOrigin(host: string, webOrigin?: string): string {
+  if (webOrigin) return webOrigin;
+  const hostParts = host.split(".");
+  return `https://${hostParts.length > 2 ? hostParts.slice(1).join(".") : host}`;
+}
+
 export async function fetchChatListViaWebSocket(params: {
   host: string;
   ctsToken: string;
   encryptionKeyId: string;
   timeoutMs?: number;
+  webOrigin?: string;
 }): Promise<ExpressChat[]> {
   const { host, ctsToken, encryptionKeyId, timeoutMs = 15000 } = params;
   const instanceId = randomUUID();
@@ -41,12 +49,11 @@ export async function fetchChatListViaWebSocket(params: {
       done(() => reject(new Error("WebSocket timeout: no chat_list response")));
     }, timeoutMs);
 
-    const hostParts = host.split('.');
-  const webOrigin = `https://${hostParts.length > 2 ? hostParts.slice(1).join('.') : host}`;
+    const origin = resolveWebOrigin(host, params.webOrigin);
 
   const ws = new WebSocket(wsUrl, {
       headers: {
-        Origin: webOrigin,
+        Origin: origin,
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
       },
     });
@@ -117,6 +124,7 @@ export async function createPersonalChatViaWebSocket(params: {
   myHuid: string;
   targetHuid: string;
   timeoutMs?: number;
+  webOrigin?: string;
 }): Promise<string> {
   const { host, ctsToken, encryptionKeyId, myHuid, targetHuid, timeoutMs = 15000 } = params;
   const instanceId = randomUUID();
@@ -131,12 +139,11 @@ export async function createPersonalChatViaWebSocket(params: {
       done(() => reject(new Error("WebSocket timeout: no chat_new response")));
     }, timeoutMs);
 
-    const hostParts = host.split(".");
-    const webOrigin = `https://${hostParts.length > 2 ? hostParts.slice(1).join(".") : host}`;
+    const origin = resolveWebOrigin(host, params.webOrigin);
 
     const ws = new WebSocket(wsUrl, {
       headers: {
-        Origin: webOrigin,
+        Origin: origin,
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
       },
     });

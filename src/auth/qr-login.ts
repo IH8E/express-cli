@@ -149,7 +149,7 @@ export function buildQrMaterial(cliOverrides: Partial<Config> = {}): QrMaterial 
     locale: config.locale,
     manufacturer: "Google",
     platform: "web",
-    platform_package_id: "com.pyligrim.alphach",
+    platform_package_id: config.qr_platform_package_id,
   });
 
   return { registrationId, encryptionKey, qrSigningKey, udid, qrPayload, qrBody, config };
@@ -287,15 +287,33 @@ export async function completeQrRegistration(
     if (process.env.EXPRESS_DEBUG) log(`  [DEBUG] ETS auth_token saved (${etsAuthToken.length} chars)`);
   }
 
-  if (!ctsRegistrationToken) throw new Error("No cts_registration_token — cannot confirm with CTS");
+  // Public (RTS-only) deployments don't issue a cts_registration_token and expose a single
+  // API host. The ETS auth_token from step 2 is then the bearer for every endpoint.
+  const rtsOnly = !ctsRegistrationToken;
+  if (rtsOnly && !etsAuthToken) {
+    throw new Error(
+      "Server issued no cts_registration_token and no ETS auth_token — cannot authenticate.\n" +
+      "If this is a public deployment, make sure `ets_host` and `web_origin` point at it.",
+    );
+  }
 
+  let accessToken: string | undefined;
+  let refreshToken: string | undefined;
+  let expiresIn: number | undefined;
+  let serverId = userHuid;
+  let encryptedRtsToken: string | undefined;
+
+  if (rtsOnly) {
+    log("\nStep 3: Skipped CTS confirm — RTS-only deployment (using ETS token).");
+    accessToken = etsAuthToken;
+  } else {
   log("\nStep 3: Confirming with CTS (AD integration)...");
 
   const ctsUrl = `${getBaseUrl(config)}/api/v1/ad_integration/register_confirm/qr`;
   const adConfirmBody = JSON.stringify({
     rts_registration_id: registrationId,
     temp_token: ctsRegistrationToken,
-    ets: true,
+    ets: config.qr_register_ets,
   });
 
   const adConfirmHeaders = signQrRequest({
@@ -316,11 +334,11 @@ export async function completeQrRegistration(
   if (!adRes.ok) throw new Error(`AD integration confirm failed (${adRes.status}): ${adText.slice(0, 500)}`);
 
   const adData = extractResult(JSON.parse(adText) as AdIntegrationConfirmResponse);
-  const accessToken = adData.access_token;
-  const refreshToken = adData.refresh_token;
-  const expiresIn = adData.expires_in;
-  const serverId = (adData as Record<string, unknown>).server_id as string ?? userHuid;
-  const encryptedRtsToken = (adData as Record<string, unknown>).encrypted_rts_token as string | undefined;
+  accessToken = adData.access_token;
+  refreshToken = adData.refresh_token;
+  expiresIn = adData.expires_in;
+  serverId = (adData as Record<string, unknown>).server_id as string ?? userHuid;
+  encryptedRtsToken = (adData as Record<string, unknown>).encrypted_rts_token as string | undefined;
 
   if (process.env.EXPRESS_DEBUG) {
     const adDataRaw = JSON.parse(adText);
@@ -330,6 +348,7 @@ export async function completeQrRegistration(
   }
 
   if (!accessToken) throw new Error(`No access_token in AD confirm response: ${adText.slice(0, 500)}`);
+  }
 
   setAuthToken(accessToken);
   if (refreshToken) setRefreshToken(refreshToken);
@@ -338,7 +357,7 @@ export async function completeQrRegistration(
     log(`  Token expires in ${expiresIn}s (refresh after ${(expiresIn / 2 / 60).toFixed(0)} min)`);
   }
 
-  log(`  CTS confirmed. Access token: ${accessToken.slice(0, 40)}...`);
+  log(`  ${rtsOnly ? "RTS" : "CTS"} access token: ${accessToken.slice(0, 40)}...`);
 
   log("\nStep 4: Registering device token...");
 
@@ -350,7 +369,7 @@ export async function completeQrRegistration(
     manufacturer: "Google",
     platform: "web",
     locale: config.locale,
-    platform_package_id: "com.pyligrim.alphach",
+    platform_package_id: config.qr_platform_package_id,
     device_meta: {
       pushes: false,
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -538,6 +557,11 @@ export async function completeQrRegistration(
   } else if (existingCts) {
     ctsKey = existingCts;
     log(`  Reusing existing CTS key: ${existingCts.keyId.slice(0, 8)}... (not re-registering)`);
+  } else if (rtsOnly) {
+    // An RTS-only account has no CTS key and nothing is sealed to one: its messages use the
+    // rts key (decrypt falls back to encryptionKey when ctsKey is absent). Minting a cts key
+    // here would make decryption pick it — and then every message would fail `key not for us`.
+    log("  No CTS key: RTS-only account, messages use the rts key.");
   } else {
     const currentCts = await fetchCurrentAccountCtsKey(getBaseUrl(config), accessToken, userHuid, webOrigin);
     if (currentCts) {

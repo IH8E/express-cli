@@ -40,7 +40,11 @@ export async function resolveChat(
   opts: { create?: boolean } = {},
 ): Promise<{ chatId: string | null; name?: string; userHuid?: string }> {
   if (/^[0-9a-f-]{36}$/i.test(chatIdOrName)) {
-    // a person's huid (e.g. from contacts_search) vs a chat/thread id: only a huid has a profile
+    // Ambiguous on purpose: a 36-char UUID is either a chat/thread id or a person's huid.
+    // Only a huid has a profile, so a profile means "person". No profile means the caller
+    // passed a chat/thread id — returning it raw is correct, and the send/read layer is the
+    // one place that can tell a chat from a thread (see getChatKeyIds), so existence is
+    // verified there rather than guessed here.
     const [person] = await new UserApi(client).getProfilesByHuid([chatIdOrName]);
     if (!person) return { chatId: chatIdOrName };
     const dm = (await new ChatsApi(client).listChats())
@@ -53,6 +57,15 @@ export async function resolveChat(
   const lower = chatIdOrName.toLowerCase();
   const matches = chats.filter((c) => (c.name ?? "").toLowerCase().includes(lower));
   if (matches.length === 1) return { chatId: matches[0].group_chat_id, name: matches[0].name };
+  // The tools print a short id (first 8 chars) when a chat has no name — accept it back.
+  if (/^[0-9a-f-]{4,35}$/i.test(chatIdOrName)) {
+    const byId = chats.filter((c) => c.group_chat_id?.toLowerCase().startsWith(lower));
+    if (byId.length === 1) return { chatId: byId[0].group_chat_id, name: byId[0].name };
+    if (byId.length > 1) {
+      const ids = byId.map((c) => `  ${c.name ?? "(no name)"} (${c.group_chat_id})`).join("\n");
+      throw new Error(`Multiple chats start with "${chatIdOrName}":\n${ids}\nUse the full chat ID.`);
+    }
+  }
   if (matches.length > 1) {
     const names = matches.map((c) => `  ${c.name} (${c.group_chat_id})`).join("\n");
     throw new Error(`Multiple chats match "${chatIdOrName}":\n${names}\nUse the full chat ID.`);

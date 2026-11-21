@@ -2,7 +2,7 @@ import { ApiClient } from "./client.js";
 import { fetchChatListViaWebSocket, createPersonalChatViaWebSocket } from "./websocket.js";
 import { getAuthToken } from "../config/store.js";
 import { loadApigwKeys } from "../auth/keys.js";
-import { loadConfig, getBaseUrl } from "../config/index.js";
+import { loadConfig, getBaseUrl, getWebOrigin } from "../config/index.js";
 import { UserApi } from "./user.js";
 import type { ExpressChat } from "../types/index.js";
 
@@ -44,6 +44,7 @@ export class ChatsApi {
         host,
         ctsToken,
         encryptionKeyId: ctsKeyId,
+        webOrigin: getWebOrigin(config),
       });
     } catch (err) {
       console.error(`Warning: WebSocket failed (${(err as Error).message}), falling back to corporate directory.\n`);
@@ -80,6 +81,6 @@ export class ChatsApi {
     if (!ctsToken || !encryptionKeyId) throw new Error("Not authenticated");
 
     const myHuid = (await new UserApi(this.client).getSelfProfile()).user_huid;
-    return createPersonalChatViaWebSocket({ host, ctsToken, encryptionKeyId, myHuid, targetHuid });
+    return createPersonalChatViaWebSocket({ host, ctsToken, encryptionKeyId, myHuid, targetHuid, webOrigin: getWebOrigin(config) });
   }
 }

@@ -250,6 +250,23 @@ export function makeNormalizer(deps: McpToolDeps) {
  * true only when older history exists AND none of the requested boundaries (since /
  * since_message_id) was reached inside the page. Exported for tests.
  */
+/** A freshly created DM is not subscribed on the server yet, so the first `message_new`
+ *  comes back as "unmatched topic". Retrying briefly is what makes the first message to a
+ *  new person go through; any other error is rethrown unchanged. */
+export async function withTopicRetry<T>(send: () => Promise<T>, attempts = 4): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await send();
+    } catch (err) {
+      lastErr = err;
+      if (!/unmatched topic/i.test(String(err))) throw err;
+      await new Promise((r) => setTimeout(r, 700));
+    }
+  }
+  throw lastErr;
+}
+
 export function sliceHistory(
   msgs: DecryptedMessage[],
   page: { full: boolean; oldestAt?: string },
@@ -356,8 +373,15 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
     const q = query.toLowerCase();
     const found = chats.filter((c) => (c.name ?? "").toLowerCase().includes(q)).map((c) => ({ name: c.name, chat_id: c.group_chat_id, type: c.chat_type }));
     if (found.length) return ok(found);
-    // No chat yet — say whether the person exists, so the agent doesn't conclude they don't
-    const people = await new PhonebookApi(new ApiClient()).searchUsers(query, 5);
+    // No chat yet — say whether the person exists, so the agent doesn't conclude they don't.
+    // Phonebook search skips profiles with a hidden ad_login / no email, so also resolve a
+    // bare huid (e.g. copied from a message) through the profile API.
+    const client = new ApiClient();
+    if (/^[0-9a-f-]{36}$/i.test(query.trim())) {
+      const [person] = await new UserApi(client).getProfilesByHuid([query.trim()]);
+      if (person) return ok([{ name: person.name, chat_id: null, type: "person", user_huid: person.user_huid, note: "No DM with this person yet; send_message creates one." }]);
+    }
+    const people = await new PhonebookApi(client).searchUsers(query, 5);
     return ok(people.map((p) => ({ name: p.name, chat_id: null, type: "person", user_huid: p.user_huid, note: "No DM with this person yet; send_message creates one." })));
   }));
 
@@ -517,7 +541,9 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
       if (typeof quote === "string") return ok({ error: quote });
       const shown = targets.reduce((t, m, i) => t.split(`@{mention:${withMentions!.mentions[i].mention_id}}`).join(`@${m.all ? "all" : m.name}`), body);
       return ok({
-        sent: false, dry_run: true, chat_id: chatId, chat: name ?? (chatId && chatNames.get(chatId)) ?? chatId?.slice(0, 8),
+        sent: false, dry_run: true,
+        ...(chatId ? { chat_id: chatId } : {}),
+        chat: name ?? (chatId && chatNames.get(chatId)) ?? chatId?.slice(0, 8) ?? "new DM",
         ...(userHuid ? { user_huid: userHuid } : {}),
         ...(chatId ? {} : { note: "No DM with this person yet — a real send creates one." }),
         text: shown, characters: shown.length,
@@ -528,11 +554,12 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
     }
     const { chatId } = await resolveChatNamed(client, chat, true);
     if (!chatId) throw new Error(`Could not resolve chat "${chat}"`);
+    if (process.env.EXPRESS_DEBUG) process.stderr.write(`[mcp] send to chat ${chatId}\n`);
     const reply = reply_to ? await quoteForReply(client, chatId, reply_to) : undefined;
     if (typeof reply === "string") return ok({ error: reply });
     const res = file_path
-      ? await sendFileViaWebSocket({ client, chatId, filePath: file_path, caption: text, reply })
-      : await sendMessageViaWebSocket({ client, chatId, body, reply, mentions: withMentions?.mentions });
+      ? await withTopicRetry(() => sendFileViaWebSocket({ client, chatId, filePath: file_path, caption: text, reply }))
+      : await withTopicRetry(() => sendMessageViaWebSocket({ client, chatId, body, reply, mentions: withMentions?.mentions }));
     return ok({ sent: true, chat_id: chatId, sync_id: res.sync_id });
   }));
 

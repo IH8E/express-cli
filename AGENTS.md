@@ -108,7 +108,7 @@ node ./dist/index.js status history                    # история стат
 
 **Два сервера**:
 - CTS (основной) — Bearer token, WebSocket; адрес задаётся через `EXPRESS_HOST` или `config.host`
-- ETS (apigw) — ed25519-подпись, используется только для auth activation; адрес выводится из CTS-хоста (`ets.<domain>`)
+- ETS (apigw) — ed25519-подпись, используется только для auth activation; адрес выводится из CTS-хоста (`ets.<domain>`), переопределяется `config.ets_host` (URL или голый хост)
 
 **WebSocket** (`wss://<host>/socket/user/websocket?vsn=1.0.0`):
 - Phoenix protocol: authenticate → chat_list / chat_info / message_new
@@ -170,6 +170,16 @@ node ./dist/index.js status history                    # история стат
 **Поиск chat_id по имени**: `chats find` или `send message "имя"` — разрешает UUID автоматически.
 
 **Сборка после изменений**: `npm run build` (tsup, ~20ms).
+
+**MCP должен бежать из этого checkout, а не из npm.** `~/.dsh/cordis.patch.yml` держит запись `mcp-achat`: `node <этот репо>/dist/index.js mcp`. Раньше там стоял `npx @ih8e/express-cli@0.1.9` — фиксированная старая версия, из-за которой правки в `src/` не доходили до инструментов (симптомы: пустой `user_huid` в `dry_run`, `unmatched topic` на свежем DM, `chats_find` не находит человека по huid). После правок — `npm run build`, конфиг подхватывается dsh-hmr без перезапуска сессии.
+
+**Профили и второй сервер.** `EXPRESS_CLI_CONFIG_DIR` читается `conf` ОДИН раз при импорте `config/store.ts`, поэтому один процесс = один профиль. Публичный (`ru.public.express` + `https://corp.express`) держим отдельно: `EXPRESS_CLI_CONFIG_DIR=/tmp/express-public`. Корпоративный — дефолтный стор.
+- Публичный деплой **RTS-only** (`allowCtsLogin: false` в конфиге веб-клиента): `cts_registration_token` не выдаётся, ETS `auth_token` работает как Bearer для всех эндпоинтов (проверено: `ad_integration/token` 204, `kdc/keys` 200, WS `authenticate` + `system/chat_list` ok, activation 204). Шаги 4–6 (device token, ключи, activation) в RTS-ветке выполняются как обычно — пропускается только CTS-confirm (шаг 3).
+- **`cts`-ключ на RTS-аккаунте НЕ чеканить.** Сообщения публичного аккаунта запечатаны на `rts`-ключ (`key.key_id` = rts id, `sender_conn_type: "rts"`). `decryptMessages` берёт `ctsKey ?? encryptionKey`, поэтому лишний `cts` перекрыл бы рабочий ключ → `key not for us` на каждом сообщении. Guard в `qr-login.ts`: при `rtsOnly` без `cts`-ключа из handshake/стора — ветка не минтит. `unboxMessageKey`/`getSenderPublicKey` уже умеют rts (fallback на `encryptionKey`), тесты — `src/api/rts-decrypt.test.ts`.
+- Профили: корпоративный — `POST /api/v1/phonebook/cts_profiles/query` (`cts_profiles[]`), публичный — `POST /api/v3/phonebook/profiles/query` (`profiles[]` с `cts_public_profile` / `rts_profile`). `UserApi.getProfilesByHuid` каскадит v1 → v3. Глобальный `phonebook/search` на публичном отвечает 404, а люди с `ad_login: "hidden"` не находятся и на корпоративном — поэтому `chats_find` резолвит голый `huid` через профильный API.
+- Свежий DM не подписан на сервере: первый `message_new` отбивается `unmatched topic` → `withTopicRetry` (4 попытки, 700мс), но только на эту ошибку.
+- **Серверы НЕ федеративны.** Чат, созданный на одном, второму неизвестен (`chat_info` → `chat_not_found`). Один и тот же человек даёт **две отдельные переписки**: `huid` собеседника совпадает (и имя, и `cts_id` server `<server-id>`), а ваш — разный (например `1f79…` на корпоративном `cts1.$domain`, `168c…` на публичном, оба принадлежат одному человеку). Публичный `cts_public_profile` умеет отдавать корпоративное имя по huid — это справочник, не федерация чатов.
+
 
 ## Ключи и шифрование — детали
 

@@ -74,9 +74,17 @@ export class PhonebookApi {
   }
 
   async searchUsersPhonebook(query: string, limit: number): Promise<ExpressProfile[]> {
-    const data = await this.client.get<unknown>(
-      `/api/v3/phonebook/search?query=${encodeURIComponent(query)}&active=true&disable_fuzzy_search=false`,
-    );
+    let data: unknown;
+    try {
+      data = await this.client.get<unknown>(
+        `/api/v3/phonebook/search?query=${encodeURIComponent(query)}&active=true&disable_fuzzy_search=false`,
+      );
+    } catch (err) {
+      // Public (RTS-only) deployments have no global phonebook: the route 404s. That is
+      // "no match", not a transport failure — callers fall back to a huid or a chat name.
+      if (/API error 404/.test((err as Error).message)) return [];
+      throw err;
+    }
     if (!data || typeof data !== "object") return [];
     // client.get already unwraps `result`, so data is {phonebook: [...]} directly
     const obj = data as Record<string, unknown>;

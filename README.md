@@ -10,6 +10,13 @@
 
 > ⚠️ Внутренний инструмент. HAR-файлы, дампы трафика и токены **не коммитятся** (см. `.gitignore`).
 
+## Содержание
+
+- [Два сервера: корпоративный и публичный](#два-сервера-корпоративный-и-публичный) — с чего начать
+- [Требования](#требования) · [Установка](#установка)
+- [Аутентификация](#аутентификация) · [CLI](#cli) · [TUI](#tui) · [MCP-сервер](#mcp-сервер)
+- [Архитектура](#архитектура) · [Разработка](#разработка) · [Безопасность](#безопасность)
+
 ## Требования
 
 - **Node.js ≥ 20**.
@@ -34,6 +41,95 @@ express-cli auth qr
 
 > Ниже примеры используют глобальную команду `express-cli`. Без глобальной установки
 > замените её на `node ./dist/index.js`.
+
+## Два сервера: корпоративный и публичный
+
+CLI умеет работать с двумя разными деплоями eXpress. **Корпоративный — дефолт**, для него
+ничего настраивать не нужно. Публичный включается одной переменной окружения.
+
+| | Корпоративный | Публичный |
+| --- | --- | --- |
+| Для чего | ваш рабочий eXpress (`cts1.$domain`) | `https://corp.express` |
+| Настройка | ничего, это дефолт | 5 ключей + отдельный профиль |
+| Хранилище | стандартный каталог `conf` | свой каталог в `EXPRESS_CLI_CONFIG_DIR` |
+| Ключ E2E | общий `cts`-ключ аккаунта | `rts`-ключ (CTS-логин не выдаётся) |
+| Чтение/отправка | работают | работают (проверено) |
+
+### Корпоративный — просто работает
+
+`$domain` ниже — домен вашего eXpress, а `cts1` — его CTS-хост.
+
+```bash
+express-cli config set host cts1.$domain      # один раз
+express-cli auth qr
+express-cli chats list
+```
+
+`ets`-хост и веб-origin выводятся сами из `host`: `ets.$domain` и `https://$domain`.
+Проверить, что вы в корпоративном профиле:
+
+```bash
+express-cli config list
+# {
+#   "host": "cts1.$domain"
+# }
+```
+
+### Публичный — отдельный профиль
+
+Два деплоя **нельзя смешивать в одном профиле**: у них разные ключи, а `conf` читает
+каталог профиля один раз при старте процесса. Поэтому публичный живёт в своём каталоге,
+и переключаетесь вы переменной `EXPRESS_CLI_CONFIG_DIR`.
+
+Настройка (один раз):
+
+```bash
+export EXPRESS_CLI_PROFILE=~/.config/express-public   # любой каталог вне репозитория
+
+EXPRESS_CLI_CONFIG_DIR=$EXPRESS_CLI_PROFILE express-cli config set host ru.public.express
+EXPRESS_CLI_CONFIG_DIR=$EXPRESS_CLI_PROFILE express-cli config set ets_host https://ru.public.express
+EXPRESS_CLI_CONFIG_DIR=$EXPRESS_CLI_PROFILE express-cli config set web_origin https://corp.express
+EXPRESS_CLI_CONFIG_DIR=$EXPRESS_CLI_PROFILE express-cli config set qr_platform_package_id ru.unlimitedtech.express
+EXPRESS_CLI_CONFIG_DIR=$EXPRESS_CLI_PROFILE express-cli config set qr_register_ets false
+
+EXPRESS_CLI_CONFIG_DIR=$EXPRESS_CLI_PROFILE express-cli auth qr
+```
+
+Переключение — один алиас, дальше команды те же самые:
+
+```bash
+alias xpub='EXPRESS_CLI_CONFIG_DIR=~/.config/express-public express-cli'
+
+xpub chats list              # публичный
+express-cli chats list       # корпоративный
+xpub messages list <chat-id>
+xpub mcp                     # MCP-сервер на публичном профиле
+```
+
+Убедиться, какой профиль активен:
+
+```bash
+xpub config list
+# {
+#   "host": "ru.public.express",
+#   "ets_host": "https://ru.public.express",
+#   "web_origin": "https://corp.express",
+#   "qr_platform_package_id": "ru.unlimitedtech.express",
+#   "qr_register_ets": false
+# }
+```
+
+> ⚠️ **Публичный `auth qr` создаёт отдельный аккаунт.** Ваш `huid` на публичном сервере
+> отличается от корпоративного, поэтому с одним и тем же человеком у вас будет **две
+> независимые переписки** — серверы не федеративны, и чат, созданный на одном, второму
+> неизвестен. Это не баг, а устройство сервиса.
+
+> ⚠️ **Каталог профиля должен быть постоянным.** Если задать его во временном каталоге
+> (например, `/tmp/express-public`), профиль исчезнет после перезагрузки и логин придётся
+> повторять.
+
+Отдельного `platform_package_id` для публичного профиля не нужно: он используется только
+`auth login` (device-логин), а не `auth qr`.
 
 ## Аутентификация
 
@@ -110,6 +206,24 @@ express-cli api <path> [-X <method>] [-d '<json>']   # произвольный 
 | `EXPRESS_LOCALE` | локаль запросов (по умолчанию `ru`) |
 | `EXPRESS_OUTPUT` | формат вывода по умолчанию (`table`/`json`) |
 | `EXPRESS_DEBUG` | подробный лог подписи apigw-запросов (в stderr) |
+
+### Ключи конфига деплоя
+
+Нужны только для нестандартной инсталляции (публичный сервер — см.
+[«Два сервера»](#два-сервера-корпоративный-и-публичный) в начале).
+По умолчанию `ets`-хост и веб-origin выводятся из `host`.
+
+| Ключ | По умолчанию | Назначение |
+| --- | --- | --- |
+| `host` | — (обязателен) | CTS-хост, например `cts1.$domain` |
+| `ets_host` | `ets.<domain>` | база ETS/apigw (URL или голый хост) |
+| `web_origin` | `https://<domain>` | `Origin`/`Referer` для web API и WS-хендшейка |
+| `qr_platform_package_id` | `com.pyligrim.alphach` | пакет устройства для `auth qr` |
+| `qr_register_ets` | `true` | `false` — QR-логин как у публичного RTS-клиента |
+| `platform_package_id` | `ru.alfabank` | пакет устройства для `auth login` (не для QR) |
+
+Значения для публичного `corp.express` сняты с его же встроенного конфига
+(`regions.ru.host`, `ccsHost`, `platformPackageId`), а не подобраны наугад.
 
 ## TUI
 
