@@ -180,9 +180,11 @@ export async function sendMessageViaWebSocket(params: {
   body: string;
   reply?: ReplyQuote;
   mentions?: WireMention[];
+  /** ISO timestamp: deliver later instead of now (delayed_message_new). */
+  scheduledAt?: string;
   timeoutMs?: number;
-}): Promise<{ sync_id: string }> {
-  const { client, chatId, body, reply, mentions, timeoutMs = 20000 } = params;
+}): Promise<{ sync_id: string; scheduled_at?: string }> {
+  const { client, chatId, body, reply, mentions, scheduledAt, timeoutMs = 20000 } = params;
 
   await sodium.ready;
 
@@ -251,6 +253,7 @@ export async function sendMessageViaWebSocket(params: {
     encryptedKeys,
     encryptedPayload,
     signature,
+    scheduledAt,
     timeoutMs,
   });
 }
@@ -476,9 +479,13 @@ async function sendMessageNew(params: {
   encryptedKeys: EncryptedKey[];
   encryptedPayload: string;
   signature: { sign: string; sign_key_id: string; sign_algo: string };
+  /** Delayed delivery: send `delayed_message_new` instead of `message_new`. */
+  scheduledAt?: string;
   timeoutMs: number;
-}): Promise<{ sync_id: string }> {
-  const { host, webOrigin, ctsToken, encKeyId, chatId, syncId, encryptedKeys, encryptedPayload, signature, timeoutMs } = params;
+}): Promise<{ sync_id: string; scheduled_at?: string }> {
+  const { host, webOrigin, ctsToken, encKeyId, chatId, syncId, encryptedKeys, encryptedPayload, signature, scheduledAt, timeoutMs } = params;
+  // A delayed message goes to the `system` topic, not `groupchat:<id>` (HAR 21.11).
+  const isDelayed = Boolean(scheduledAt);
   const wsUrl = `wss://${host}/socket/user/websocket?vsn=1.0.0&auto_join=true&key_id=${encKeyId}&version=6&background=false&voex_unencrypted=true&instance_id=${randomUUID()}`;
 
   return new Promise((resolve, reject) => {
@@ -512,14 +519,15 @@ async function sendMessageNew(params: {
       if (msg.ref === authRef && msg.event === "phx_reply" && msg.payload?.status === "ok") {
         msgRef = ref++;
         send({
-          topic: `groupchat:${chatId}`,
-          event: "message_new",
+          topic: isDelayed ? "system" : `groupchat:${chatId}`,
+          event: isDelayed ? "delayed_message_new" : "message_new",
           payload: {
             keys: encryptedKeys,
             group_chat_id: chatId,
             sync_id: syncId,
             payload: encryptedPayload,
             signature,
+            ...(isDelayed ? { scheduled_at: scheduledAt, bundle_events: [] } : {}),
           },
           ref: msgRef,
         });
@@ -530,9 +538,10 @@ async function sendMessageNew(params: {
         clearTimeout(timer);
         ws.close();
         if (msg.payload?.status === "ok") {
-          done(() => resolve({ sync_id: syncId }));
+          done(() => resolve(isDelayed ? { sync_id: syncId, scheduled_at: scheduledAt } : { sync_id: syncId }));
         } else {
-          done(() => reject(new Error(`message_new failed: ${JSON.stringify(msg.payload?.response)}`)));
+          const event = isDelayed ? "delayed_message_new" : "message_new";
+          done(() => reject(new Error(`${event} failed: ${JSON.stringify(msg.payload?.response)}`)));
         }
       }
     });
@@ -622,4 +631,140 @@ export async function reactViaWebSocket(params: { event: HistoryMessage; reactio
   const { event, reaction, remove } = params;
   await systemCall(remove ? "remove_reaction" : "add_reaction",
     { reaction, event_sync_id: event.sync_id, event_sender: event.sender }, `groupchat:${event.group_chat_id}`);
+}
+
+/** Pending (not yet delivered) messages for a chat: `system/delayed_message_list`.
+ *  The server answers `{delayed_messages: []}` — entries carry the same envelope as
+ *  message_new (sync_id, payload, keys, signature, scheduled_at). */
+export async function listDelayedMessages(params: {
+  client: ApiClient;
+  chatId: string;
+  timeoutMs?: number;
+}): Promise<Array<Record<string, unknown>>> {
+  const { chatId, timeoutMs = 15000 } = params;
+  const apigwKeys = loadApigwKeys();
+  if (!apigwKeys) throw new Error("No apigw keys. Run 'express auth qr' first.");
+  const config = loadConfig();
+  const host = new URL(getBaseUrl(config)).hostname;
+  const webOrigin = getWebOrigin(config);
+  const ctsToken = getAuthToken();
+  if (!ctsToken) throw new Error("Not authenticated. Run 'express auth qr' first.");
+  const encKeyId = (apigwKeys.ctsKey ?? apigwKeys.encryptionKey).keyId;
+
+  const wsUrl = `wss://${host}/socket/user/websocket?vsn=1.0.0&auto_join=true&key_id=${encKeyId}&version=6&background=false&instance_id=${randomUUID()}`;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
+    const timer = setTimeout(() => { try { ws.close(); } catch {} done(() => reject(new Error("Timeout listing delayed messages"))); }, timeoutMs);
+    const ws = new WebSocket(wsUrl, { headers: { Origin: webOrigin, "User-Agent": "Mozilla/5.0" } });
+    let ref = 0;
+    const authRef = ref++;
+    const listRef = ref++;
+    ws.addEventListener("open", () => ws.send(JSON.stringify({ topic: "phoenix", event: "authenticate", payload: { token: ctsToken }, ref: authRef })));
+    ws.addEventListener("message", (e) => {
+      const msg = JSON.parse(e.data as string) as { ref: number; event: string; payload: { status: string; response: Record<string, unknown> } };
+      if (msg.ref === authRef && msg.event === "phx_reply") {
+        if (msg.payload?.status !== "ok") { clearTimeout(timer); ws.close(); done(() => reject(new Error("WS auth failed"))); return; }
+        ws.send(JSON.stringify({ topic: "system", event: "delayed_message_list", payload: { group_chat_id: chatId }, ref: listRef }));
+        return;
+      }
+      if (msg.ref === listRef && msg.event === "phx_reply") {
+        clearTimeout(timer);
+        ws.close();
+        const list = (msg.payload?.response?.delayed_messages ?? []) as Array<Record<string, unknown>>;
+        if (msg.payload?.status !== "ok") { done(() => reject(new Error(`delayed_message_list failed: ${JSON.stringify(msg.payload?.response)}`))); return; }
+        done(() => resolve(list));
+      }
+    });
+    ws.addEventListener("error", (err) => { clearTimeout(timer); done(() => reject(new Error(`WS error: ${String(err)}`))); });
+  });
+}
+
+/** Cancel one queued delayed message (it never gets delivered). `system/delayed_message_delete`
+ *  answers an empty ok and removes the entry; plain `delete_events` does not work for these
+ *  (the queue entry is not an event yet — it fails with `sync_id_not_found`). */
+export async function cancelDelayedMessage(params: {
+  chatId: string;
+  syncId: string;
+  timeoutMs?: number;
+}): Promise<void> {
+  const { chatId, syncId, timeoutMs = 15000 } = params;
+  const apigwKeys = loadApigwKeys();
+  if (!apigwKeys) throw new Error("No apigw keys. Run 'express auth qr' first.");
+  const config = loadConfig();
+  const host = new URL(getBaseUrl(config)).hostname;
+  const webOrigin = getWebOrigin(config);
+  const ctsToken = getAuthToken();
+  if (!ctsToken) throw new Error("Not authenticated. Run 'express auth qr' first.");
+  const encKeyId = (apigwKeys.ctsKey ?? apigwKeys.encryptionKey).keyId;
+  const wsUrl = `wss://${host}/socket/user/websocket?vsn=1.0.0&auto_join=true&key_id=${encKeyId}&version=6&background=false&instance_id=${randomUUID()}`;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
+    const timer = setTimeout(() => { try { ws.close(); } catch {} done(() => reject(new Error("Timeout cancelling delayed message"))); }, timeoutMs);
+    const ws = new WebSocket(wsUrl, { headers: { Origin: webOrigin, "User-Agent": "Mozilla/5.0" } });
+    let ref = 0;
+    const authRef = ref++;
+    const delRef = ref++;
+    ws.addEventListener("open", () => ws.send(JSON.stringify({ topic: "phoenix", event: "authenticate", payload: { token: ctsToken }, ref: authRef })));
+    ws.addEventListener("message", (e) => {
+      const msg = JSON.parse(e.data as string) as { ref: number; event: string; payload: { status: string; response: Record<string, unknown> } };
+      if (msg.ref === authRef && msg.event === "phx_reply") {
+        if (msg.payload?.status !== "ok") { clearTimeout(timer); ws.close(); done(() => reject(new Error("WS auth failed"))); return; }
+        ws.send(JSON.stringify({ topic: "system", event: "delayed_message_delete", payload: { sync_id: syncId, group_chat_id: chatId }, ref: delRef }));
+        return;
+      }
+      if (msg.ref === delRef && msg.event === "phx_reply") {
+        clearTimeout(timer); ws.close();
+        if (msg.payload?.status === "ok") done(() => resolve());
+        else done(() => reject(new Error(`delayed_message_delete failed: ${JSON.stringify(msg.payload?.response)}`)));
+      }
+    });
+    ws.addEventListener("error", (err) => { clearTimeout(timer); done(() => reject(new Error(`WS error: ${String(err)}`))); });
+  });
+}
+
+/** Full chat details via `system/chat_info` (request_version 6). The web client uses this,
+ *  not `/api/v1/messaging/chats/open_chats_list`, which answers an empty list for every id. */
+export async function getChatInfoViaWebSocket(params: {
+  chatId: string;
+  timeoutMs?: number;
+}): Promise<Record<string, unknown> | null> {
+  const { chatId, timeoutMs = 15000 } = params;
+  const apigwKeys = loadApigwKeys();
+  if (!apigwKeys) throw new Error("No apigw keys. Run 'express auth qr' first.");
+  const config = loadConfig();
+  const host = new URL(getBaseUrl(config)).hostname;
+  const webOrigin = getWebOrigin(config);
+  const ctsToken = getAuthToken();
+  if (!ctsToken) throw new Error("Not authenticated. Run 'express auth qr' first.");
+  const encKeyId = (apigwKeys.ctsKey ?? apigwKeys.encryptionKey).keyId;
+  const wsUrl = `wss://${host}/socket/user/websocket?vsn=1.0.0&auto_join=true&key_id=${encKeyId}&version=6&background=false&instance_id=${randomUUID()}`;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
+    const timer = setTimeout(() => { try { ws.close(); } catch {} done(() => reject(new Error("Timeout fetching chat info"))); }, timeoutMs);
+    const ws = new WebSocket(wsUrl, { headers: { Origin: webOrigin, "User-Agent": "Mozilla/5.0" } });
+    let ref = 0;
+    const authRef = ref++;
+    const infoRef = ref++;
+    ws.addEventListener("open", () => ws.send(JSON.stringify({ topic: "phoenix", event: "authenticate", payload: { token: ctsToken }, ref: authRef })));
+    ws.addEventListener("message", (e) => {
+      const msg = JSON.parse(e.data as string) as { ref: number; event: string; payload: { status: string; response: Record<string, unknown> } };
+      if (msg.ref === authRef && msg.event === "phx_reply") {
+        if (msg.payload?.status !== "ok") { clearTimeout(timer); ws.close(); done(() => reject(new Error("WS auth failed"))); return; }
+        ws.send(JSON.stringify({ topic: "system", event: "chat_info", payload: { group_chat_id: chatId, request_version: 6 }, ref: infoRef }));
+        return;
+      }
+      if (msg.ref === infoRef && msg.event === "phx_reply") {
+        clearTimeout(timer); ws.close();
+        const info = msg.payload?.response?.chat_info as Record<string, unknown> | undefined;
+        // A thread has no chat_info; the caller decides that a missing chat is "not found".
+        done(() => resolve(msg.payload?.status === "ok" && info ? info : null));
+      }
+    });
+    ws.addEventListener("error", (err) => { clearTimeout(timer); done(() => reject(new Error(`WS error: ${String(err)}`))); });
+  });
 }

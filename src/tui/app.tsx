@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { activeTypers, applyTyping, typingLabel as buildTypingLabel, type TypingState } from "./typing.js";
 import { Box, Text, useApp, useInput, useStdin, useStdout } from "ink";
 import TextInput from "ink-text-input";
 import { ExpressSession, type SessionMessage, type ThreadSummary } from "../session/session.js";
@@ -6,8 +7,11 @@ import { readMessages } from "../api/messages-read.js";
 import { sendMessageViaWebSocket } from "../api/messaging-ws.js";
 import { UserApi } from "../api/user.js";
 import { ApiClient } from "../api/client.js";
-import { renderImage } from "./image.js";
-import type { ImageAttachment } from "../api/decrypt.js";
+import { renderImageHiRes } from "./image.js";
+import { fetchImageBytes, downloadImageFile } from "../api/image-bytes.js";
+import { openInSystemViewer } from "./open-file.js";
+import type { FileAttachment, ImageAttachment } from "../api/decrypt.js";
+import { readMessageEvents } from "../api/messages-read.js";
 import { ALL_MENTION_HUID, MENTION_RE } from "../api/mentions.js";
 import type { ExpressChat } from "../types/index.js";
 
@@ -20,6 +24,8 @@ interface DisplayMsg {
   insertedAt: string;
   type?: string;
   image?: ImageAttachment;
+  /** Encrypted original file — present on image messages, used by the `i` full view. */
+  attachment?: FileAttachment;
 }
 
 type Focus = "chats" | "thread" | "input" | "discussions";
@@ -46,8 +52,8 @@ function parseBody(body: string): Seg[] {
   return out.length ? out : [{ text: body }];
 }
 
-const toDisplay = (m: { sync_id: string; sender: string; body: string; decrypted: boolean; error?: string; inserted_at: string; type?: string; image?: ImageAttachment }): DisplayMsg =>
-  ({ syncId: m.sync_id, sender: m.sender, body: m.body, decrypted: m.decrypted, error: m.error, insertedAt: m.inserted_at, type: m.type, image: m.image });
+const toDisplay = (m: { sync_id: string; sender: string; body: string; decrypted: boolean; error?: string; inserted_at: string; type?: string; image?: ImageAttachment; attachment?: FileAttachment }): DisplayMsg =>
+  ({ syncId: m.sync_id, sender: m.sender, body: m.body, decrypted: m.decrypted, error: m.error, insertedAt: m.inserted_at, type: m.type, image: m.image, attachment: m.attachment });
 
 export function App() {
   const { exit } = useApp();
@@ -72,10 +78,16 @@ export function App() {
   const [threadCursor, setThreadCursor] = useState(0);
   const [openThreadId, setOpenThreadId] = useState<string | null>(null);
   const [threadTitles, setThreadTitles] = useState<Record<string, string>>({});
-  const [renderedImages, setRenderedImages] = useState<Record<string, string>>({});
+  /** Full-image overlay: `i` opens it, Esc closes. Rendered INSTEAD of the message list,
+   *  never inside it — block art wider than the panel gets wrapped by Ink, which used to
+   *  bleed neighbouring message text over the picture. */
+  const [imageView, setImageView] = useState<{ syncId: string; title: string; art?: string; error?: string; savedTo?: string } | null>(null);
+  /** Huid → expiry epoch ms, per chat. A "печатает…" hint that clears itself. */
+  const [typing, setTyping] = useState<TypingState>({});
+  /** Live thread reply counters from `thread_counter_updated`, keyed by thread_id. */
+  const [liveThreadCounters, setLiveThreadCounters] = useState<Record<string, number>>({});
   const requested = useRef<Set<string>>(new Set());
   const titleRequested = useRef<Set<string>>(new Set());
-  const imgRequested = useRef<Set<string>>(new Set());
   const currentIdRef = useRef<string | undefined>(undefined);
 
   const visibleChats = useMemo(
@@ -159,6 +171,18 @@ export function App() {
       });
       if (m.chatId !== currentIdRef.current) setUnread((u) => ({ ...u, [m.chatId]: (u[m.chatId] ?? 0) + 1 }));
     });
+    session.on("typing", ({ chatId, userHuid, stopped }: { chatId: string; userHuid: string; stopped: boolean }) => {
+      if (!userHuid) return;
+      setTyping((prev) => applyTyping(prev, { chatId, userHuid, stopped }, Date.now()));
+    });
+    session.on("threadCounters", ({ counters }: { counters: Array<{ threadId: string; counter: number }> }) => {
+      if (!counters.length) return;
+      setLiveThreadCounters((prev) => {
+        const next = { ...prev };
+        for (const c of counters) next[c.threadId] = c.counter;
+        return next;
+      });
+    });
     session.on("reconnecting", ({ attempt }: { attempt: number }) => setStatus({ text: `reconnecting (#${attempt})…`, color: "yellow" }));
     session.on("disconnected", () => setStatus({ text: "disconnected", color: "yellow" }));
     session.on("error", () => { /* status reflects it on disconnect */ });
@@ -212,6 +236,7 @@ export function App() {
   useEffect(() => {
     setDiscussionsOpen(false);
     setOpenThreadId(null);
+    setImageView(null);
     if (currentId) setUnread((u) => (u[currentId] ? { ...u, [currentId]: 0 } : u));
   }, [currentId]);
 
@@ -221,19 +246,69 @@ export function App() {
     threadsForChat.forEach((t) => fetchThreadTitle(t.thread_id));
   }, [discussionsOpen, threadsForChat]);
 
-  // Render the inline preview of the currently-selected image message
+  // A typing hint has no "stopped" event when a draft is abandoned, so it expires on a
+  // timer; this re-render is what actually removes it from the screen.
+  const [, setTick] = useState(0);
   useEffect(() => {
-    const m = focus === "thread" ? activeMessages?.[msgCursor] : undefined;
-    const uri = m?.image?.previewDataUri;
-    if (!m || !uri || renderedImages[m.syncId] || imgRequested.current.has(m.syncId)) return;
-    imgRequested.current.add(m.syncId);
-    const w = Math.min(40, Math.max(10, cols - 36));
-    renderImage(uri, w)
-      .then((s) => setRenderedImages((p) => ({ ...p, [m.syncId]: s })))
-      .catch(() => imgRequested.current.delete(m.syncId));
-  }, [focus, msgCursor, activeMessages]);
+    const t = setInterval(() => setTick((n) => n + 1), 2000);
+    return () => clearInterval(t);
+  }, []);
+
+  /** Load the original file for an image message and render it in place of the preview.
+   *  The inline `blur_preview_file` is deliberately blurred, so it is fine as a placeholder
+   *  but unreadable for a screenshot; this fetches and decrypts the real attachment once. */
+  const openImageView = (m: DisplayMsg) => {
+    const target = openThreadId ?? currentId;
+    if (!target || !m.image) return;
+    const title = m.image.fileName;
+    setImageView({ syncId: m.syncId, title });
+    (async () => {
+      const events = await readMessageEvents({ chatId: target, limit: 200 });
+      const event = events.find((e) => e.sync_id === m.syncId);
+      if (!event) throw new Error("message not found in recent history");
+      const client = new ApiClient();
+      const { bytes } = await fetchImageBytes({ client, chatId: target, event });
+      // Fit inside the right panel on BOTH axes. The 80-column cap that used to be here threw
+      // away half the detail on a wide terminal; the panel is `cols - 34`, less the border
+      // and padding. Height keeps room for the border, title and the "Esc — закрыть" hint.
+      const w = Math.max(20, cols - 38);
+      const h = Math.max(4, rows - 6);
+      // Hi-res path: pre-scale with Lanczos + unsharp, then render at that exact pixel grid.
+      const art = await renderImageHiRes(Buffer.from(bytes).toString("base64"), w, h);
+      setImageView((cur) => (cur && cur.syncId === m.syncId ? { ...cur, art } : cur));
+    })().catch((err) => {
+      setImageView((cur) => (cur && cur.syncId === m.syncId ? { ...cur, error: (err as Error).message } : cur));
+    });
+  };
+
+  /** Save the original file and hand it to the OS viewer.
+   *  A terminal cell is two pixels, so block art keeps ~7% of a screenshot; the viewer shows
+   *  the actual file. This is the only way to see real detail, not an extra rendition. */
+  const openOriginal = async (syncId: string) => {
+    const target = openThreadId ?? currentId;
+    if (!target) return;
+    setImageView((cur) => (cur && cur.syncId === syncId ? { ...cur, savedTo: undefined, error: undefined } : cur));
+    try {
+      const events = await readMessageEvents({ chatId: target, limit: 200 });
+      const event = events.find((e) => e.sync_id === syncId);
+      if (!event) throw new Error("message not found in recent history");
+      const { path } = await downloadImageFile({ client: new ApiClient(), chatId: target, event });
+      openInSystemViewer(path);
+      setImageView((cur) => (cur && cur.syncId === syncId ? { ...cur, savedTo: path } : cur));
+    } catch (err) {
+      setImageView((cur) => (cur && cur.syncId === syncId ? { ...cur, error: (err as Error).message } : cur));
+    }
+  };
 
   useInput((input, key) => {
+    // The image overlay swallows keys first: Esc closes it, anything else is ignored so a
+    // stray keystroke does not move the cursor under a picture the user is looking at.
+    if (imageView) {
+      if (key.escape || input === "i" || input === "q") { setImageView(null); return; }
+      if (key.ctrl && input === "c") { sessionRef.current?.close(); exit(); return; }
+      if (input === "o") void openOriginal(imageView.syncId);
+      return;
+    }
     if (focus === "input") { if (key.escape) setFocus(openThreadId ? "thread" : "chats"); return; }
     if (input === "q" || (key.ctrl && input === "c")) { sessionRef.current?.close(); exit(); return; }
 
@@ -263,6 +338,7 @@ export function App() {
         else setFocus("chats");
       }
       else if (key.return) setFocus("input");
+      else if (input === "i" && activeMessages?.[msgCursor]?.image) openImageView(activeMessages[msgCursor]);
     }
   }, { isActive: isRawModeSupported });
 
@@ -293,9 +369,14 @@ export function App() {
     );
 
   const rightBorder = focus === "input" ? "green" : (focus === "thread" || focus === "discussions") ? "cyan" : "gray";
-  const rightTitle = openThreadId
-    ? `💬 ${threadTitle(openThreadId) ?? "Обсуждение"}`
-    : (current ? displayChatName(current) : "—") + (threadsForChat.length ? `  💬 ${threadsForChat.length}` : "");
+  // Who is typing right now in the open chat (expired hints drop out on the next tick).
+  const typingLabel = buildTypingLabel(activeTypers(typing, openThreadId ?? currentId ?? "", Date.now()), senderLabel);
+
+  const rightTitle = imageView
+    ? "изображение"
+    : openThreadId
+      ? `💬 ${threadTitle(openThreadId) ?? "Обсуждение"}`
+      : (current ? displayChatName(current) : "—") + (threadsForChat.length ? `  💬 ${threadsForChat.length}` : "");
 
   return (
     <Box flexDirection="column" height={rows}>
@@ -323,9 +404,26 @@ export function App() {
         </Box>
 
         <Box flexDirection="column" flexGrow={1} borderStyle="single" borderColor={rightBorder} paddingX={1}>
-          <Text bold wrap="truncate">{rightTitle}</Text>
+          <Box>
+            <Text bold wrap="truncate">{rightTitle}</Text>
+            {typingLabel ? <Text color="yellow" wrap="truncate">{`  ${typingLabel}`}</Text> : null}
+          </Box>
           <Box flexDirection="column" flexGrow={1}>
-            {showDiscussions ? (
+            {imageView ? (
+              // Full-image screen. Rendered INSTEAD of the list: block art is wide and Ink
+              // wraps it, which is what used to overlay neighbouring message text on the art.
+              <Box flexDirection="column" flexGrow={1}>
+                <Text bold wrap="truncate">🖼 {imageView.title}</Text>
+                {imageView.error
+                  ? <Text color="red" wrap="wrap">не удалось: {imageView.error}</Text>
+                  : imageView.art
+                    ? <Text>{imageView.art}</Text>
+                    : <Text dimColor>загружаю и расшифровываю…</Text>}
+                {imageView.savedTo
+                  ? <Text dimColor wrap="truncate">  сохранено: {imageView.savedTo}</Text>
+                  : <Text dimColor>  o — открыть в системном просмотрщике · Esc — закрыть</Text>}
+              </Box>
+            ) : showDiscussions ? (
               <>
                 {threadsForChat.length === 0 && <Text dimColor>no discussions</Text>}
                 {threadsForChat.map((t, i) => {
@@ -333,7 +431,7 @@ export function App() {
                   const title = threadTitle(t.thread_id) ?? t.thread_id.slice(0, 8);
                   return (
                     <Text key={t.thread_id} color={on ? "black" : undefined} backgroundColor={on ? "cyan" : undefined} wrap="truncate">
-                      {on ? "› " : "  "}💬 {title}  <Text dimColor={!on}>· {t.counter ?? 0} · {clock(t.last_event_inserted_at ?? "")}</Text>
+                      {on ? "› " : "  "}💬 {title}  <Text dimColor={!on}>· {liveThreadCounters[t.thread_id] ?? t.counter ?? 0} · {clock(t.last_event_inserted_at ?? "")}</Text>
                     </Text>
                   );
                 })}
@@ -347,7 +445,6 @@ export function App() {
                   const idx = threadStart + i;
                   const mine = m.sender === selfHuid || m.sender === "me";
                   const onCursor = focus === "thread" && idx === msgCursor;
-                  const img = renderedImages[m.syncId];
                   return (
                     <Box key={m.syncId} flexDirection="column">
                       <Text wrap="wrap">
@@ -361,7 +458,13 @@ export function App() {
                             ? <Text color="cyan">🖼 {m.image.fileName}{m.body ? ` — ${m.body}` : ""}</Text>
                             : renderBody(m)}
                       </Text>
-                      {onCursor && m.image?.previewDataUri && (img ? <Text>{img}</Text> : <Text dimColor>  rendering preview…</Text>)}
+                      {onCursor && m.image && (
+                        // No inline art here on purpose. Block art rendered inside the message
+                        // list overflows the viewport: `estLines` counts text only, so Ink drew
+                        // more rows than fit and the picture bled through neighbouring messages.
+                        // The `i` overlay is the single place art is drawn.
+                        <Text dimColor>  «i» — открыть оригинал целиком</Text>
+                      )}
                     </Box>
                   );
                 })}

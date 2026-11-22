@@ -98,3 +98,32 @@ export async function downloadAttachment(params: {
   writeFileSync(target, plaintext);
   return { path: target, fileName, mimeType: attachment.mimeType, size: plaintext.length };
 }
+
+/** Download and decrypt an attachment fully in memory (no temp file).
+ *
+ *  Same pipeline as `downloadAttachment`: fetch → secretstream → hash check. Used by the
+ *  TUI to render a real image instead of the blurred inline preview, where writing the file
+ *  to disk first would just add a stat + read. Returns the plaintext bytes. */
+export async function fetchAttachmentBytes(params: {
+  chatId: string;
+  attachment: FileAttachment;
+  streamKey: Uint8Array;
+}): Promise<{ bytes: Uint8Array; fileName: string; mimeType?: string }> {
+  const { chatId, attachment, streamKey } = params;
+
+  const token = getAuthToken();
+  if (!token) throw new Error("Not authenticated. Run 'express auth qr' first.");
+  const path = attachment.file.startsWith("/") ? attachment.file : `/uploads/files/${chatId}/${attachment.file}`;
+  const res = await fetch(`${getBaseUrl(loadConfig())}${path}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "*/*" },
+  });
+  if (!res.ok) throw new Error(`File download failed: ${res.status} ${res.statusText}`);
+  const encrypted = new Uint8Array(await res.arrayBuffer());
+
+  await sodium.ready;
+  const plaintext = decryptFileStream(encrypted, streamKey, attachment.chunkSize);
+  if (attachment.fileHash && Buffer.from(sodium.crypto_generichash(32, plaintext, null)).toString("base64") !== attachment.fileHash) {
+    throw new Error("Attachment hash mismatch — file corrupted or wrong key.");
+  }
+  return { bytes: plaintext, fileName: attachment.fileName || "file", mimeType: attachment.mimeType };
+}

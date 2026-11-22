@@ -61,6 +61,7 @@ const MAX_RECONNECT_DELAY_MS = 30_000;
  * re-connects with backoff + token refresh. Reused by the TUI and MCP layers.
  *
  * Events: `connected`, `chats` (ExpressChat[]), `activity` (SessionActivity),
+ *         `typing` ({chatId, userHuid, action, stopped}), `threadCounters` ({chatId, counters}),
  * `message` (SessionMessage), `disconnected` ({code}), `reconnecting`
  * ({attempt, delayMs}), `error` (Error).
  */
@@ -227,6 +228,34 @@ export class ExpressSession extends EventEmitter {
       clearTimeout(p.timer);
       if (frame.payload?.status === "ok") p.resolve(frame.payload.response ?? {});
       else p.reject(new Error(`${frame.event} failed: ${JSON.stringify(frame.payload?.response)}`));
+      return;
+    }
+
+    // Live push: someone is typing in a subscribed chat. Carries only the huid and the
+    // action ("text"), no content — enough for a "печатает…" hint that expires on its own.
+    if (ref == null && (frame.event === "typing" || frame.event === "stop_typing")) {
+      const p = frame.payload as Record<string, unknown>;
+      const chatId = frame.topic.replace("groupchat:", "");
+      this.emit("typing", {
+        chatId,
+        userHuid: (p.user_huid as string) ?? "",
+        action: (p.action_type as string) ?? "text",
+        stopped: frame.event === "stop_typing",
+      });
+      return;
+    }
+
+    // Live push: thread reply counters for one chat (`thread_counter[]`).
+    if (ref == null && frame.event === "thread_counter_updated") {
+      const p = frame.payload as Record<string, unknown>;
+      const chatId = frame.topic.replace("groupchat:", "");
+      const counters = (p.thread_counter ?? []) as Array<{ thread_id?: string; counter?: number }>;
+      this.emit("threadCounters", {
+        chatId,
+        counters: counters
+          .filter((c) => c.thread_id)
+          .map((c) => ({ threadId: c.thread_id!, counter: c.counter ?? 0 })),
+      });
       return;
     }
 

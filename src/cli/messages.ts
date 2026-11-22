@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import { readMessages } from "../api/messages-read.js";
+import { parseLimit } from "./limits.js";
 import { formatOutput, type OutputFormat } from "./output.js";
 
 export function createMessagesCommand(): Command {
@@ -17,7 +18,7 @@ export function createMessagesCommand(): Command {
       try {
         const messages = await readMessages({
           chatId,
-          limit: parseInt(opts.limit, 10) || 20,
+          limit: parseLimit(opts.limit, { fallback: 20, max: 1000 }),
           host: opts.host,
         });
 

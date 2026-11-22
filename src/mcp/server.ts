@@ -8,7 +8,14 @@ import { ApiClient } from "../api/client.js";
 import { PhonebookApi } from "../api/phonebook.js";
 import { UserApi } from "../api/user.js";
 import { readMessageEvents } from "../api/messages-read.js";
-import { deleteMessagesViaWebSocket, editMessageViaWebSocket, reactViaWebSocket, sendFileViaWebSocket, sendMessageViaWebSocket, type ReplyQuote } from "../api/messaging-ws.js";
+import { parseSchedule } from "../api/schedule.js";
+import { getCommonChats, getMessageInfo } from "../api/history.js";
+import { getPresence } from "../api/presence.js";
+import { getChatListChanges } from "../api/chat-changes.js";
+import { setSilentMode } from "../api/silent.js";
+import { markChatRead } from "../api/read-position.js";
+import { getChatRules } from "../api/chat-rules.js";
+import { cancelDelayedMessage, getChatInfoViaWebSocket, deleteMessagesViaWebSocket, editMessageViaWebSocket, listDelayedMessages, reactViaWebSocket, sendFileViaWebSocket, sendMessageViaWebSocket, type ReplyQuote } from "../api/messaging-ws.js";
 import { resolveChat, resolvePerson, listChatsWithNames } from "../api/resolve.js";
 import { downloadAttachment, unboxStreamKey } from "../api/attachments.js";
 import { decryptMessages, fetchKeyMap, getSenderPublicKey, unboxMessageKey, type DecryptedMessage, type FileAttachment, type HistoryMessage, type ReplyRef } from "../api/decrypt.js";
@@ -271,18 +278,30 @@ export function sliceHistory(
   msgs: DecryptedMessage[],
   page: { full: boolean; oldestAt?: string },
   opts: { since?: number; sinceMessageId?: string },
-): { items: DecryptedMessage[]; hasMore: boolean } {
+): { items: DecryptedMessage[]; hasMore: boolean; cursorMissed?: boolean } {
   let items = [...msgs].sort((a, b) => Date.parse(a.inserted_at) - Date.parse(b.inserted_at));
   let boundaryReached = false;
   if (opts.since !== undefined) {
     items = items.filter((m) => Date.parse(m.inserted_at) >= opts.since!);
     if (page.oldestAt && Date.parse(page.oldestAt) < opts.since) boundaryReached = true;
   }
+  let cursorMissed = false;
   if (opts.sinceMessageId) {
     const idx = items.findIndex((m) => m.sync_id === opts.sinceMessageId);
     if (idx >= 0) { items = items.slice(idx + 1); boundaryReached = true; }
+    // The page did not contain the cursor: it may simply be older than the window, but the
+    // caller must not silently present the whole page as "everything newer than X".
+    else cursorMissed = true;
   }
-  return { items, hasMore: page.full && !boundaryReached };
+  return { items, hasMore: page.full && !boundaryReached, cursorMissed };
+}
+
+/** Whether a sync_id names a real event in this chat. A forward page from a cursor starts AT
+ *  it, so a returned first event with another id means there is no such event. */
+async function messageExists(chatId: string, syncId: string): Promise<boolean> {
+  if (!/^[0-9a-f-]{36}$/i.test(syncId.trim())) return false;
+  const page = await readMessageEvents({ chatId, limit: 1, direction: "forward", fromSyncId: syncId.trim() });
+  return page.some((e) => e.sync_id === syncId.trim());
 }
 
 /** Find one message event by full sync_id (direct fetch) or by a unique prefix (searched in
@@ -377,11 +396,16 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
     // Phonebook search skips profiles with a hidden ad_login / no email, so also resolve a
     // bare huid (e.g. copied from a message) through the profile API.
     const client = new ApiClient();
-    if (/^[0-9a-f-]{36}$/i.test(query.trim())) {
-      const [person] = await new UserApi(client).getProfilesByHuid([query.trim()]);
+    const trimmed = query.trim();
+    // A UUID is never a name: if it resolves to no profile, report that and stop. Falling
+    // through to the phonebook used to hand back a random person, because the search runs
+    // with fuzzy matching and matches almost any string.
+    if (/^[0-9a-f-]{36}$/i.test(trimmed)) {
+      const [person] = await new UserApi(client).getProfilesByHuid([trimmed]);
       if (person) return ok([{ name: person.name, chat_id: null, type: "person", user_huid: person.user_huid, note: "No DM with this person yet; send_message creates one." }]);
+      return ok([]);
     }
-    const people = await new PhonebookApi(client).searchUsers(query, 5);
+    const people = await new PhonebookApi(client).searchUsers(trimmed, 5);
     return ok(people.map((p) => ({ name: p.name, chat_id: null, type: "person", user_huid: p.user_huid, note: "No DM with this person yet; send_message creates one." })));
   }));
 
@@ -427,6 +451,16 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
     const msgs = await decryptMessages(events, apigwKeys, client);
     const oldestAt = events.reduce<string | undefined>((min, e) => (!min || e.inserted_at < min ? e.inserted_at : min), undefined);
     const sliced = sliceHistory(msgs, { full: page.length >= window, oldestAt }, { since: sinceMs, sinceMessageId: since_message_id });
+    // A cursor missing from the page is ambiguous: it may just be older than the window (then
+    // every page message IS newer, and returning them is right) or nonexistent (then the
+    // caller would read the whole page as "newer than X"). Ask the server which one it is.
+    if (sliced.cursorMissed) {
+      const cursorExists = await messageExists(chatId, since_message_id!);
+      if (!cursorExists) {
+        return ok({ error: `since_message_id ${since_message_id} does not exist in this chat. ` +
+          `Pass a sync_id from messages_list, or use 'since' with a timestamp.` });
+      }
+    }
     let items = sliced.items;
     if (unreadCount !== undefined) items = items.slice(Math.max(0, items.length - unreadCount));
 
@@ -521,9 +555,10 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
       reply_to: z.string().optional().describe("sync_id of a message in this chat to reply to (shown quoted, like a reply in the app)"),
       mentions: z.array(z.string()).optional().describe("People to @mention: full name, email or huid; \"all\" for everyone in the chat"),
       file_path: z.string().optional().describe("Local file to attach (any type; .png/.jpg/.jpeg/.gif/.webp go as images); `text` becomes its caption"),
+      scheduled_at: z.string().optional().describe("Deliver later instead of now: ISO timestamp, or a relative '+5m' / '+2h' / '+1d'. Must be in the future."),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-  }, async ({ chat, text, dry_run, reply_to, mentions, file_path }) => withHumanErrors(async () => {
+  }, async ({ chat, text, dry_run, reply_to, mentions, file_path, scheduled_at }) => withHumanErrors(async () => {
     if (!await ensureAuth()) return notAuthenticated();
     if (mentions?.length && file_path) return ok({ error: "mentions with file_path is not supported yet — send the mention as a separate text message." });
     const client = new ApiClient();
@@ -557,10 +592,194 @@ export function registerTools(server: McpServer, deps: McpToolDeps): void {
     if (process.env.EXPRESS_DEBUG) process.stderr.write(`[mcp] send to chat ${chatId}\n`);
     const reply = reply_to ? await quoteForReply(client, chatId, reply_to) : undefined;
     if (typeof reply === "string") return ok({ error: reply });
+    if (scheduled_at && file_path) return ok({ error: "scheduled_at with file_path is not supported — schedule a text message instead." });
+    let scheduleIso: string | undefined;
+    if (scheduled_at) {
+      scheduleIso = parseSchedule(scheduled_at);
+    }
     const res = file_path
       ? await withTopicRetry(() => sendFileViaWebSocket({ client, chatId, filePath: file_path, caption: text, reply }))
-      : await withTopicRetry(() => sendMessageViaWebSocket({ client, chatId, body, reply, mentions: withMentions?.mentions }));
-    return ok({ sent: true, chat_id: chatId, sync_id: res.sync_id });
+      : scheduled_at
+        ? await sendMessageViaWebSocket({ client, chatId, body, reply, mentions: withMentions?.mentions, scheduledAt: scheduleIso })
+        : await withTopicRetry(() => sendMessageViaWebSocket({ client, chatId, body, reply, mentions: withMentions?.mentions }));
+    return ok(scheduled_at
+      ? { sent: false, scheduled: true, chat_id: chatId, sync_id: res.sync_id, scheduled_at: scheduleIso }
+      : { sent: true, chat_id: chatId, sync_id: res.sync_id });
+  }));
+
+  server.registerTool("chat_info", {
+    title: "Chat details",
+    description: "Full details of a chat: name, description, members count, admins, creator, avatar, type, created/updated time, threads_enabled, chat_settings, pinned message and has_delayed_messages.",
+    inputSchema: { chat: z.string().describe("Chat name (partial ok) or full chat_id") },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async ({ chat }) => withHumanErrors(async () => {
+    if (!await ensureAuth()) return notAuthenticated();
+    const client = new ApiClient();
+    const chatId = await resolveExistingChat(client, chat);
+    const info = await getChatInfoViaWebSocket({ chatId });
+    if (!info) return ok({ error: `No chat with id ${chatId} (a thread has no chat_info — use thread_read).` });
+    return ok({ chat: info.name ?? chatNames.get(chatId) ?? chatId.slice(0, 8), chat_id: chatId, info });
+  }));
+
+  server.registerTool("chat_rules", {
+    title: "Chat upload rules",
+    description: "Upload limits for a chat: per-content-type size caps in MB and the list of blocked file extensions. Check before sending a file — the server rejects violations only after the bytes are encrypted and posted.",
+    inputSchema: { chat: z.string().describe("Chat name (partial ok) or full chat_id") },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async ({ chat }) => withHumanErrors(async () => {
+    if (!await ensureAuth()) return notAuthenticated();
+    const client = new ApiClient();
+    const chatId = await resolveExistingChat(client, chat);
+    const rules = await getChatRules({ chatId });
+    return ok({ chat_id: chatId, ...rules });
+  }));
+
+  server.registerTool("mark_read", {
+    title: "Mark chat as read",
+    description: "Mark a chat read up to a message (defaults to the newest one), clearing its unread badge. Reports chat_position_report; chat_info.read_position_at and the unread counter reflect it.",
+    inputSchema: {
+      chat: z.string().describe("Chat name (partial ok) or full chat_id"),
+      message_id: z.string().optional().describe("sync_id to mark read up to; defaults to the newest message"),
+      clean_missed_calls: z.boolean().optional().describe("Also clear the missed-calls badge"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async ({ chat, message_id, clean_missed_calls }) => withHumanErrors(async () => {
+    if (!await ensureAuth()) return notAuthenticated();
+    const client = new ApiClient();
+    const chatId = await resolveExistingChat(client, chat);
+    let positionId = message_id;
+    if (!positionId) {
+      const newest = await readMessageEvents({ chatId, limit: 1 });
+      positionId = newest[0]?.sync_id;
+      if (!positionId) return ok({ error: "This chat has no messages to mark read." });
+    }
+    const result = await markChatRead({ chatId, positionSyncId: positionId, cleanMissedCalls: clean_missed_calls ?? false });
+    return ok(result);
+  }));
+
+  server.registerTool("silent_mode", {
+    title: "Do not disturb",
+    description: "Turn the account's silent (do-not-disturb) mode on or off. This is the account-wide flag, not per-message stealth. Idempotent.",
+    inputSchema: { enabled: z.boolean().describe("true to silence, false to resume notifications") },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async ({ enabled }) => withHumanErrors(async () => {
+    if (!await ensureAuth()) return notAuthenticated();
+    const result = await setSilentMode({ enabled });
+    return ok(result);
+  }));
+
+  server.registerTool("presence", {
+    title: "User presence",
+    description: "Online/offline status for people by full name, email or huid. Presence is push-only on this server: the tool subscribes and reads the first broadcast, so it is a snapshot (a few seconds), not a live feed.",
+    inputSchema: {
+      people: z.array(z.string()).min(1).max(50).describe("Full names, emails or huids"),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async ({ people }) => withHumanErrors(async () => {
+    if (!await ensureAuth()) return notAuthenticated();
+    const client = new ApiClient();
+    const huids: string[] = [];
+    const names = new Map<string, string>();
+    for (const p of people) {
+      if (/^[0-9a-f-]{36}$/i.test(p.trim())) { huids.push(p.trim()); continue; }
+      const profile = await resolvePerson(client, p);
+      huids.push(profile.user_huid);
+      names.set(profile.user_huid, profile.name);
+    }
+    const statuses = await getPresence({ userHuids: huids });
+    return ok({
+      count: statuses.length,
+      statuses: statuses.map((s) => ({ ...s, name: names.get(s.user_huid) })),
+      ...(statuses.length < huids.length ? { note: "Presence is broadcast-driven; some users may be missing from the snapshot." } : {}),
+    });
+  }));
+
+  server.registerTool("chats_changes", {
+    title: "Chat list delta",
+    description: "Incremental chat-list sync since a cursor: structural changes (members, name, settings) and light changes (unread position, last event, delayed-message flags). Cheaper than chats_list when polling.",
+    inputSchema: {
+      since: z.string().describe("ISO timestamp of the last sync (from a previous generated_at)"),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async ({ since }) => withHumanErrors(async () => {
+    if (!await ensureAuth()) return notAuthenticated();
+    const sinceMs = Date.parse(since);
+    if (Number.isNaN(sinceMs)) return ok({ error: `Invalid 'since' value: ${since}. Use an ISO date-time.` });
+    const changes = await getChatListChanges({ since: new Date(sinceMs).toISOString() });
+    return ok({
+      base_count: changes.base.length,
+      frequent_count: changes.frequent.length,
+      generated_at: changes.generated_at,
+      base: changes.base,
+      frequent: changes.frequent,
+    });
+  }));
+
+  server.registerTool("message_info", {
+    title: "Message details",
+    description: "Current state of specific messages by sync_id: body, sender, inserted_at, edited_at, deleted_at and version. Unlike messages_list it finds a message no matter how far back it is. Note: eXpress keeps no edit history — an edit overwrites the payload and only bumps edited_at, so previous text is unrecoverable.",
+    inputSchema: {
+      chat: z.string().describe("Chat name (partial ok) or full chat_id"),
+      message_ids: z.array(z.string()).min(1).max(50).describe("sync_ids to look up (from messages_list)"),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async ({ chat, message_ids }) => withHumanErrors(async () => {
+    if (!await ensureAuth()) return notAuthenticated();
+    const client = new ApiClient();
+    const chatId = await resolveExistingChat(client, chat);
+    const messages = await getMessageInfo({ client, chatId, syncIds: message_ids });
+    const missing = message_ids.filter((id) => !messages.some((m) => m.sync_id === id));
+    return ok({ chat_id: chatId, count: messages.length, messages, ...(missing.length ? { not_found: missing } : {}) });
+  }));
+
+  server.registerTool("common_chats", {
+    title: "Shared chats with a person",
+    description: "Chats you have in common with another person — useful to find where you already talked to them before starting a new DM. Accepts a person's full name, email or huid.",
+    inputSchema: { person: z.string().describe("Person's full name, email or huid") },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async ({ person }) => withHumanErrors(async () => {
+    if (!await ensureAuth()) return notAuthenticated();
+    const client = new ApiClient();
+    const profile = await resolvePerson(client, person);
+    const chats = await getCommonChats({ client, userHuid: profile.user_huid });
+    return ok({ person: profile.name, user_huid: profile.user_huid, count: chats.length, chats });
+  }));
+
+  server.registerTool("delayed_messages_list", {
+    title: "List queued messages",
+    description: "List messages scheduled for later delivery in a chat (send_message with scheduled_at). Returns sync_id, scheduled_at and failed_at per entry; cancel one with delayed_message_cancel.",
+    inputSchema: { chat: z.string().describe("Chat name (partial ok) or full chat_id") },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async ({ chat }) => withHumanErrors(async () => {
+    if (!await ensureAuth()) return notAuthenticated();
+    const client = new ApiClient();
+    const chatId = await resolveExistingChat(client, chat);
+    const pending = await listDelayedMessages({ client, chatId });
+    return ok({
+      chat: chatNames.get(chatId) ?? chatId.slice(0, 8),
+      chat_id: chatId,
+      count: pending.length,
+      messages: pending.map((p) => {
+        const e = p as Record<string, unknown>;
+        return { sync_id: e.sync_id, scheduled_at: e.scheduled_at, failed_at: e.failed_at ?? null };
+      }),
+    });
+  }));
+
+  server.registerTool("delayed_message_cancel", {
+    title: "Cancel a queued message",
+    description: "Cancel one message scheduled for later delivery so it never arrives. Get sync_id from delayed_messages_list. Only your own queued messages can be cancelled.",
+    inputSchema: {
+      chat: z.string().describe("Chat name (partial ok) or full chat_id"),
+      message_id: z.string().describe("sync_id from delayed_messages_list"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+  }, async ({ chat, message_id }) => withHumanErrors(async () => {
+    if (!await ensureAuth()) return notAuthenticated();
+    const client = new ApiClient();
+    const chatId = await resolveExistingChat(client, chat);
+    await cancelDelayedMessage({ chatId, syncId: message_id });
+    return ok({ cancelled: message_id, chat_id: chatId });
   }));
 
   server.registerTool("react", {

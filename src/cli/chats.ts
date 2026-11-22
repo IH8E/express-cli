@@ -1,6 +1,13 @@
 import { Command } from "commander";
 import { ChatsApi } from "../api/chats.js";
 import { UserApi } from "../api/user.js";
+import { getChatInfoViaWebSocket } from "../api/messaging-ws.js";
+import { getCommonChats } from "../api/history.js";
+import { getChatListChanges } from "../api/chat-changes.js";
+import { markChatRead } from "../api/read-position.js";
+import { getChatRules } from "../api/chat-rules.js";
+import { readMessageEvents } from "../api/messages-read.js";
+import { resolvePerson, resolveChatId } from "../api/resolve.js";
 import { ApiClient } from "../api/client.js";
 import { formatOutput, type OutputFormat } from "./output.js";
 import type { ExpressChat } from "../types/index.js";
@@ -70,7 +77,12 @@ export function createChatsCommand(): Command {
             group: ["group_chat"],
             channel: ["channel", "global"],
           };
-          const allowed = typeMap[opts.type] ?? [];
+          const allowed = typeMap[opts.type];
+          // An unknown filter used to match nothing and print an empty list, which reads as
+          // "you have no chats of that kind" instead of "that type does not exist".
+          if (!allowed) {
+            throw new Error(`Unknown --type "${opts.type}". Use one of: dm, group, channel, all.`);
+          }
           chats = chats.filter((c) => allowed.includes(c.chat_type));
         }
 
@@ -119,7 +131,12 @@ export function createChatsCommand(): Command {
             group: ["group_chat"],
             channel: ["channel", "global"],
           };
-          const allowed = typeMap[opts.type] ?? [];
+          const allowed = typeMap[opts.type];
+          // An unknown filter used to match nothing and print an empty list, which reads as
+          // "you have no chats of that kind" instead of "that type does not exist".
+          if (!allowed) {
+            throw new Error(`Unknown --type "${opts.type}". Use one of: dm, group, channel, all.`);
+          }
           chats = chats.filter((c) => allowed.includes(c.chat_type));
         }
 
@@ -156,14 +173,96 @@ export function createChatsCommand(): Command {
     .option("-o, --output <format>", "Output format", "json")
     .action(async (chatId: string, opts: { host?: string; output: OutputFormat }) => {
       try {
-        const client = new ApiClient(opts.host ? { host: opts.host } : undefined);
-        const api = new ChatsApi(client);
-        const chat = await api.getChatInfo(chatId);
+        // WS chat_info, not REST open_chats_list: the latter returns [] for every id.
+        const chat = await getChatInfoViaWebSocket({ chatId });
         if (!chat) {
           console.error(`Chat not found: ${chatId}`);
           process.exit(1);
         }
         console.log(formatOutput(chat, opts.output));
+      } catch (err) {
+        console.error(`Error: ${(err as Error).message}`);
+        process.exit(1);
+      }
+    });
+
+  cmd
+    .command("common <person>")
+    .description("Chats you share with a person (name, email or huid)")
+    .option("--host <host>", "eXpress host")
+    .option("-o, --output <format>", "Output format", "json")
+    .action(async (person: string, opts: { host?: string; output: OutputFormat }) => {
+      try {
+        const client = new ApiClient(opts.host ? { host: opts.host } : undefined);
+        const profile = await resolvePerson(client, person);
+        const chats = await getCommonChats({ client, userHuid: profile.user_huid });
+        console.log(formatOutput({ person: profile.name, user_huid: profile.user_huid, count: chats.length, chats }, opts.output));
+      } catch (err) {
+        console.error(`Error: ${(err as Error).message}`);
+        process.exit(1);
+      }
+    });
+
+  cmd
+    .command("changes")
+    .description("Incremental chat-list changes since a timestamp")
+    .option("--since <iso>", "ISO timestamp of the last sync")
+    .option("--host <host>", "eXpress host")
+    .option("-o, --output <format>", "Output format", "json")
+    .action(async (opts: { since?: string; host?: string; output: OutputFormat }) => {
+      try {
+        const since = opts.since ? new Date(opts.since) : new Date(Date.now() - 86_400_000);
+        if (Number.isNaN(since.getTime())) throw new Error(`Invalid --since "${opts.since}": expected an ISO timestamp.`);
+        const changes = await getChatListChanges({ since: since.toISOString() });
+        console.log(formatOutput({
+          since: since.toISOString(),
+          generated_at: changes.generated_at,
+          base_count: changes.base.length,
+          frequent_count: changes.frequent.length,
+          base: changes.base,
+          frequent: changes.frequent,
+        }, opts.output));
+      } catch (err) {
+        console.error(`Error: ${(err as Error).message}`);
+        process.exit(1);
+      }
+    });
+
+  cmd
+    .command("read <chat-id-or-name>")
+    .description("Mark a chat read up to the newest message")
+    .option("--message <sync-id>", "Mark read up to this message instead of the newest")
+    .option("--host <host>", "eXpress host")
+    .option("-o, --output <format>", "Output format", "json")
+    .action(async (chatIdOrName: string, opts: { message?: string; host?: string; output: OutputFormat }) => {
+      try {
+        const client = new ApiClient(opts.host ? { host: opts.host } : undefined);
+        const chatId = await resolveChatId(client, chatIdOrName);
+        let positionId = opts.message;
+        if (!positionId) {
+          const newest = await readMessageEvents({ chatId, limit: 1 });
+          positionId = newest[0]?.sync_id;
+          if (!positionId) throw new Error("This chat has no messages to mark read.");
+        }
+        const result = await markChatRead({ chatId, positionSyncId: positionId });
+        console.log(formatOutput(result, opts.output));
+      } catch (err) {
+        console.error(`Error: ${(err as Error).message}`);
+        process.exit(1);
+      }
+    });
+
+  cmd
+    .command("rules <chat-id-or-name>")
+    .description("Upload limits and blocked file extensions for a chat")
+    .option("--host <host>", "eXpress host")
+    .option("-o, --output <format>", "Output format", "json")
+    .action(async (chatIdOrName: string, opts: { host?: string; output: OutputFormat }) => {
+      try {
+        const client = new ApiClient(opts.host ? { host: opts.host } : undefined);
+        const chatId = await resolveChatId(client, chatIdOrName);
+        const rules = await getChatRules({ chatId });
+        console.log(formatOutput({ chat_id: chatId, ...rules }, opts.output));
       } catch (err) {
         console.error(`Error: ${(err as Error).message}`);
         process.exit(1);

@@ -159,11 +159,18 @@ express-cli auth refresh   # обновить токен (ключи не тро
 express-cli chats list [--type dm|group|channel]     # список чатов (ФИО для личек)
 express-cli chats find "Иванов" [--type ...]         # найти чат → полный UUID
 express-cli chats info <chat-id>                     # детали чата
+express-cli chats common "Иванов"                    # общие чаты с человеком
+express-cli chats changes [--since <iso>]            # дельты списка чатов с курсора
+express-cli chats read "Иванов"                      # отметить прочитанным
+express-cli chats rules "Иванов"                     # лимиты и запрещённые расширения
 
 # Сообщения
 express-cli messages list <chat-id> [--limit N]      # прочитать и расшифровать
 express-cli send message "Иванов" "Привет!"          # отправить (по имени или UUID)
 express-cli send file "Иванов" ./report.pdf [--caption "..."]  # отправить файл (изображения)
+express-cli send message "Иванов" "текст" --at "+5m" # отложенная отправка (ISO или +5m/+2h/+1d)
+express-cli send delayed "Иванов"                    # что стоит в очереди
+express-cli send cancel "Иванов" <sync-id>           # отменить отложенное
 express-cli listen [--activity] [--avatar]           # стрим входящих сообщений в терминал
 
 # Контакты
@@ -176,6 +183,7 @@ express-cli contacts directory [--since <iso-date>]  # записи корпор
 # Статусы
 express-cli status self [--short]                    # свой статус
 express-cli status get <huid...> [--short]           # статусы по HUID
+express-cli status get <huid...> --live              # presence по WS (REST часто пуст)
 express-cli status history [--since <iso-date>]      # история статусов
 
 # Аватарки и файлы
@@ -185,6 +193,7 @@ express-cli download <url> [-o <path>]               # скачать файл �
 
 # Сервер, конфиг, произвольные запросы
 express-cli settings meta                            # метаданные сервера
+express-cli settings silent on|off                   # режим «не беспокоить»
 express-cli settings get [--since <iso-date>]        # настройки сервера
 express-cli config get [key] | set <key> <value> | list | reset
 express-cli api <path> [-X <method>] [-d '<json>']   # произвольный запрос к API
@@ -234,6 +243,8 @@ express-cli tui
 - слева — список чатов (непрочитанные, ФИО в личках), справа — тред, снизу — ввод;
 - **↑/↓** — чаты, **→** — войти в тред, **Enter** — писать, **q** — выход;
 - **t** — панель обсуждений (тредов) чата; **Enter** — открыть обсуждение;
+- в шапке справа — кто печатает (`Иванов печатает…`), счётчики тредов обновляются живьём;
+- **i** — открыть оригинал на весь экран (полублоками), **o** — открыть настоящий файл в системном просмотрщике, **Esc** — закрыть;
 - mentions рендерятся как `@Имя`, картинки — как `🖼 file` + блок-арт превью под курсором.
 
 ## MCP-сервер

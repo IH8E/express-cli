@@ -4,6 +4,7 @@ import { UserApi } from "../api/user.js";
 import { ChatsApi } from "../api/chats.js";
 import { PhonebookApi } from "../api/phonebook.js";
 import { ApiClient } from "../api/client.js";
+import { parseLimit } from "./limits.js";
 import { formatProfileTable, formatOutput, type OutputFormat } from "./output.js";
 
 export function createContactsCommand(): Command {
@@ -64,7 +65,7 @@ export function createContactsCommand(): Command {
     .action(async (query: string, opts: { limit: string; host?: string; output: OutputFormat }) => {
       try {
         const client = new ApiClient(opts.host ? { host: opts.host } : undefined);
-        const limit = parseInt(opts.limit, 10);
+        const limit = parseLimit(opts.limit, { fallback: 20, max: 100 });
         const phonebook = new PhonebookApi(client);
         let profiles = await phonebook.searchUsers(query, limit);
 

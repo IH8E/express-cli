@@ -18,6 +18,8 @@ const EXPECTED_TOOLS = [
   "chats_list", "chats_find", "messages_list", "send_message", "contacts_search",
   "contacts_self", "wait_for_messages", "status", "auth_qr_start", "auth_qr_poll",
   "attachment_download", "thread_read", "edit_message", "delete_message", "react",
+  "chat_info", "delayed_messages_list", "delayed_message_cancel",
+  "message_info", "common_chats", "presence", "chats_changes", "silent_mode", "mark_read", "chat_rules",
 ];
 
 async function connectedClient() {
@@ -37,7 +39,7 @@ async function connectedClient() {
 
 after(() => { rmSync(configDir, { recursive: true, force: true }); });
 
-test("registers all 15 tools with complete annotations", async () => {
+test("registers all 25 tools with complete annotations", async () => {
   const { client } = await connectedClient();
   const { tools } = await client.listTools();
   assert.deepEqual(tools.map((t) => t.name).sort(), [...EXPECTED_TOOLS].sort());
@@ -389,4 +391,20 @@ test("withTopicRetry does not retry unrelated send errors", async () => {
     /invalid_keys/,
   );
   assert.equal(calls, 1, "a key error must surface immediately, not after retries");
+});
+
+test("sliceHistory flags a cursor missing from the page instead of returning it blindly", async () => {
+  const { sliceHistory } = await import("./server.js");
+  const mk = (id: string, at: string) => ({ sync_id: id, inserted_at: at, body: "", sender: "", decrypted: true });
+  const page = [mk("a", "2026-10-01T10:00:00Z"), mk("b", "2026-10-01T11:00:00Z")];
+
+  // present: keep only messages after it
+  const hit = sliceHistory(page, { full: true }, { sinceMessageId: "a" });
+  assert.equal(hit.cursorMissed, false);
+  assert.deepEqual(hit.items.map((m) => m.sync_id), ["b"]);
+
+  // absent: reported, so the caller can ask the server whether the id exists at all
+  const miss = sliceHistory(page, { full: true }, { sinceMessageId: "zzz" });
+  assert.equal(miss.cursorMissed, true);
+  assert.equal(miss.items.length, 2, "items are left intact — it may just be older than the window");
 });

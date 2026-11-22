@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import { SettingsApi } from "../api/settings.js";
+import { setSilentMode } from "../api/silent.js";
 import { ApiClient } from "../api/client.js";
 import { formatOutput, type OutputFormat } from "./output.js";
 
@@ -37,6 +38,24 @@ export function createSettingsCommand(): Command {
         const api = new SettingsApi(client);
         const settings = await api.getSettings(opts.since);
         console.log(formatOutput(settings, opts.output));
+      } catch (err) {
+        console.error(`Error: ${(err as Error).message}`);
+        process.exit(1);
+      }
+    });
+
+  cmd
+    .command("silent <state>")
+    .description("Turn do-not-disturb on or off (state: on|off)")
+    .option("-o, --output <format>", "Output format", "json")
+    .action(async (state: string, opts: { output: OutputFormat }) => {
+      try {
+        const normalized = state.trim().toLowerCase();
+        if (!["on", "off"].includes(normalized)) {
+          throw new Error(`Invalid state "${state}": use 'on' or 'off'.`);
+        }
+        const result = await setSilentMode({ enabled: normalized === "on" });
+        console.log(formatOutput(result, opts.output));
       } catch (err) {
         console.error(`Error: ${(err as Error).message}`);
         process.exit(1);
