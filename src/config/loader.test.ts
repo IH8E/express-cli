@@ -35,5 +35,9 @@ test("QR defaults stay the self-hosted ones so existing logins keep working", ()
   const c = cfg();
   assert.equal(c.qr_platform_package_id, "com.pyligrim.alphach");
   assert.equal(c.qr_register_ets, true);
-  assert.equal(c.platform_package_id, "ru.alfabank");
+});
+
+test("platform_package_id has no default — device login omits it unless configured", () => {
+  assert.equal(cfg().platform_package_id, undefined);
+  assert.equal(cfg({ platform_package_id: "ru.example.corp" }).platform_package_id, "ru.example.corp");
 });

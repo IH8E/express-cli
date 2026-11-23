@@ -65,7 +65,7 @@ export async function deviceLogin(cliOverrides: Partial<Config> = {}): Promise<v
     manufacturer: "Google",
     platform: config.platform,
     locale: config.locale,
-    platform_package_id: config.platform_package_id,
+    ...(config.platform_package_id ? { platform_package_id: config.platform_package_id } : {}),
     device_meta: {
       pushes: false,
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -446,7 +446,7 @@ export async function deviceLogin(cliOverrides: Partial<Config> = {}): Promise<v
     udid,
     encryption_key: "",
     auth_key: "",
-    platform_package_id: config.platform_package_id,
+    ...(config.platform_package_id ? { platform_package_id: config.platform_package_id } : {}),
   });
 
   console.log("Step 5/5: Registering push token...");

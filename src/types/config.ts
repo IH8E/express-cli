@@ -6,7 +6,8 @@ export const configSchema = z.object({
   token: z.string().optional(),
   locale: z.string().default("ru"),
   platform: z.string().default("web"),
-  platform_package_id: z.string().default("ru.alfabank"),
+  /** Device package id for `auth login`. Unset = field is omitted (the server accepts that). */
+  platform_package_id: z.string().optional(),
   /** ETS base URL or host. Default: `ets.<domain>` derived from `host`. */
   ets_host: z.string().optional(),
   /** Origin/Referer sent to the web API. Default: `https://<domain>` derived from `host`. */

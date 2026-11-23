@@ -26,7 +26,7 @@ export interface AdIntegrationTokenRequest {
   manufacturer: string;
   platform: string;
   locale: string;
-  platform_package_id: string;
+  platform_package_id?: string;
   device_meta: {
     pushes: boolean;
     timezone: string;

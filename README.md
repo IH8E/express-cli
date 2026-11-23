@@ -129,7 +129,8 @@ xpub config list
 > повторять.
 
 Отдельного `platform_package_id` для публичного профиля не нужно: он используется только
-`auth login` (device-логин), а не `auth qr`.
+`auth login` (device-логин), а не `auth qr`. И он вообще необязателен — по умолчанию
+не отправляется (см. [«Ключи конфига деплоя»](#ключи-конфига-деплоя)).
 
 ## Аутентификация
 
@@ -229,10 +230,29 @@ express-cli api <path> [-X <method>] [-d '<json>']   # произвольный 
 | `web_origin` | `https://<domain>` | `Origin`/`Referer` для web API и WS-хендшейка |
 | `qr_platform_package_id` | `com.pyligrim.alphach` | пакет устройства для `auth qr` |
 | `qr_register_ets` | `true` | `false` — QR-логин как у публичного RTS-клиента |
-| `platform_package_id` | `ru.alfabank` | пакет устройства для `auth login` (не для QR) |
+| `platform_package_id` | не задан (поле не отправляется) | пакет устройства для `auth login` (не для QR) |
 
 Значения для публичного `corp.express` сняты с его же встроенного конфига
 (`regions.ru.host`, `ccsHost`, `platformPackageId`), а не подобраны наугад.
+
+`platform_package_id` — идентификатор приложения конкретной инсталляции, а не константа
+платформы. Каждый деплой публикует свой в `express-config` своего веб-клиента
+(`https://<domain>/` → `<div class="express-config">{...,"platformPackageId":"..."}`):
+
+| Деплой | `platformPackageId` |
+| --- | --- |
+| `achat.best` (корпоративный по умолчанию) | `com.pyligrim.alphach` |
+| `corp.express` (публичный) | `ru.unlimitedtech.express` |
+
+Дефолта нет намеренно: сервер это поле не читает. `ad_integration/token` и
+`push_service/protected/token` одинаково принимают отсутствующее поле, пустую строку и
+любое значение, а `token/active` возвращает только `result: true` — списка устройств с
+этим полем нет ни в API, ни в UI. Поэтому отправлять чужой идентификатор по умолчанию
+незачем; выставляйте его только если ваша инсталляция на него опирается:
+
+```bash
+express-cli config set platform_package_id <platformPackageId из express-config>
+```
 
 ## TUI
 
